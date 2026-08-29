@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>MinerU 文档解析工作台</title>
+<link rel="stylesheet" href="/static/style.css"/>
+<link rel="stylesheet" href="/static/lib/katex/katex.min.css"/>
+<link rel="stylesheet" href="/static/lib/highlight-github.min.css"/>
+</head>
+<body>
+<div class="app">
+
+  <!-- ============ 顶栏 ============ -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">M</div>
+      <div class="brand-txt">
+        <h1>MinerU 文档解析</h1>
+        <small>本地引擎 · 隐私安全</small>
+      </div>
+    </div>
+    <div class="top-right">
+      <span class="pill"><span class="dot idle" id="engineDot"></span><span id="engineText">引擎空闲</span></span>
+      <span class="pill stage" id="engineStage" hidden></span>
+      <span class="pill batch" title="当前批次目录">批次 <span class="mono" id="topBatch">—</span></span>
+      <button class="btn sm" id="btnSettings" type="button">⚙ 输出设置</button>
+      <button class="btn primary sm" id="btnOpenOutput" type="button">📂 打开输出目录</button>
+    </div>
+  </header>
+
+  <div class="main">
+
+    <!-- ============ 左侧导航 ============ -->
+    <aside class="sidebar">
+      <div class="nav-title">功能</div>
+      <div class="nav-item on" id="navParse"><span class="ni">▤</span>文档解析</div>
+      <div class="nav-item" id="navQueue"><span class="ni">☰</span>任务队列 <span class="badge" id="navQueueBadge" hidden>0</span></div>
+      <div class="nav-item" id="navSettings"><span class="ni">⚙</span>输出设置</div>
+
+      <div class="nav-title">状态</div>
+      <div class="side-card"><div class="sc-label">解析引擎</div><div class="sc-value" id="sideEngine">空闲</div></div>
+      <div class="side-card"><div class="sc-label">当前批次</div><div class="sc-value mono" id="sideBatch">—</div></div>
+      <div class="side-card"><div class="sc-label">队列进度</div><div class="sc-value" id="sideQueue">0 / 0 份</div></div>
+
+      <div class="side-foot">输出直接写入磁盘，不打包压缩包<br/>执行中可继续追加文件<br/>任务完成自动释放引擎</div>
+    </aside>
+
+    <!-- ============ 中央工作台 ============ -->
+    <div class="col">
+
+      <!-- 上传面板 -->
+      <section class="panel upload-wrap">
+        <!-- 拖拽区：空态显示提示；有文件时内部切换为待传文件列表 -->
+        <div class="dropzone" id="dropZone">
+          <div class="dz-empty" id="dzEmpty">
+            <div class="dz-ico">⇪</div>
+            <div class="dz-main">拖拽文件到此处，或点击选择</div>
+            <div class="dz-sub">可一次选择多个文件 · 执行过程中可继续追加，自动进入队列</div>
+            <div class="dz-fmt">
+              <span class="hot">PDF</span><span class="hot">DOCX</span><span class="hot">XLSX</span>
+              <span class="hot">PPTX</span><span class="hot">PNG / JPG / TIFF</span>
+            </div>
+          </div>
+          <div class="dz-fill" id="dzFill" hidden>
+            <div class="df-head">
+              <span class="df-title">待传文件 <b id="pendingCount">0</b></span>
+              <span class="df-size" id="pendingSize"></span>
+              <button class="df-clear" id="btnClearPending" type="button">清空</button>
+            </div>
+            <div id="pendingList" class="pending-list"></div>
+            <div class="df-foot" id="dfAddMore">⇪ 拖拽更多文件到此处，或点击添加…</div>
+          </div>
+        </div>
+        <input type="file" id="fileInput" multiple hidden
+               accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.png,.jpg,.jpeg,.webp,.bmp,.tiff,.tif"/>
+
+        <!-- 提交目标批次选择器 -->
+        <div class="batch-target">
+          <span class="bt-label">提交到批次</span>
+          <div class="bt-select" id="btSelect" tabindex="0" role="listbox" aria-haspopup="listbox" aria-expanded="false">
+            <span class="bt-dot" id="btDot"></span>
+            <span class="bt-txt" id="btText">当前批次</span>
+            <span class="bt-sub" id="btSub"></span>
+            <span class="bt-caret">▾</span>
+            <div class="bt-menu" id="btMenu" hidden>
+              <div class="bt-group">当前批次</div>
+              <button type="button" class="bt-opt" data-batch="current">
+                <span class="bt-dot" data-role="cur-dot"></span>
+                <span class="bt-o-name" data-role="cur-name">—</span>
+                <span class="bt-o-sub" data-role="cur-sub"></span>
+              </button>
+              <div class="bt-group" id="btHistGroup" hidden>历史批次</div>
+              <div class="bt-hist" id="btHistList"></div>
+              <div class="bt-sep"></div>
+              <button type="button" class="bt-opt new" data-batch="new">
+                <span class="bt-dot new"></span>＋ 新建批次<span class="bt-o-sub">下次提交创建新目录</span>
+              </button>
+              <div class="bt-new-name" id="btNewNameWrap" hidden>
+                <div class="bt-new-row">
+                  <input id="btNewName" type="text" maxlength="60" spellcheck="false"
+                         placeholder="批次名称（可选），如：社稳报告"/>
+                  <button type="button" class="bt-new-btn ok" id="btNewNameOk"
+                          title="确认并收起（Enter）">✓</button>
+                  <button type="button" class="bt-new-btn" id="btNewNameClear"
+                          title="清除名称">✕</button>
+                </div>
+                <span class="bt-new-hint">命名后文件夹为「时间_名称」，如 2026-08-29_092823_社稳报告；不填则仅用时间</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 解析参数栏 -->
+        <div class="param-bar">
+          <div class="param"><label>语言</label>
+            <select id="optLang">
+              <option value="ch" selected>中文</option>
+              <option value="en">英文</option>
+              <option value="ja">日文</option>
+              <option value="ko">韩文</option>
+              <option value="auto">自动检测</option>
+            </select>
+          </div>
+          <div class="param"><label>引擎</label>
+            <select id="optBackend">
+              <option value="pipeline" selected>Pipeline（快速）</option>
+              <option value="hybrid-engine">Hybrid（高精度）</option>
+            </select>
+          </div>
+          <div class="param"><label>推理强度</label>
+            <select id="optEffort">
+              <option value="high">高</option>
+              <option value="medium" selected>中</option>
+              <option value="low">低</option>
+              <option value="none">无</option>
+            </select>
+          </div>
+          <div class="param"><label>最大页数</label><input id="optMaxPages" type="number" min="1" max="99999" value="1000"/></div>
+          <span class="divider"></span>
+          <div class="switches">
+            <label class="sw"><input type="checkbox" id="optFormula" checked/>公式识别</label>
+            <label class="sw"><input type="checkbox" id="optTable" checked/>表格识别</label>
+            <label class="sw"><input type="checkbox" id="optImage" checked/>图像分析</label>
+            <label class="sw"><input type="checkbox" id="optOcr"/>强制 OCR</label>
+          </div>
+          <div class="param-actions">
+            <button class="btn primary sm" id="btnSubmit" disabled>▶ 开始解析</button>
+            <span id="submitMsg" class="upl-msg"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 批次信息条 -->
+      <section class="batch-bar" id="batchBar">
+        <span class="bb-label">输出到批次目录</span>
+        <span class="bb-path" id="batchPath">—</span>
+        <button class="btn sm ghost" id="btnRenameBatch" title="给当前批次命名/重命名（修改输出文件夹名）" hidden>✎ 命名</button>
+        <span class="bb-tag open" id="batchTag" hidden>批次开放中</span>
+        <span class="bb-hint" id="batchHint">添加任务后自动创建</span>
+        <span class="bb-right">
+          <span class="bb-countdown" id="batchCountdown"></span>
+          <button class="btn sm ghost" id="btnOpenBatchDir">打开目录</button>
+        </span>
+      </section>
+
+      <!-- 任务队列 -->
+      <section class="panel" id="queuePanel">
+        <div class="phead">
+          <h2>任务队列</h2>
+          <div class="chips">
+            <span class="chip proc"><span class="n" id="chipProcN">0</span>解析中</span>
+            <span class="chip warn"><span class="n" id="chipWaitingN">0</span>排队</span>
+            <span class="chip ok"><span class="n" id="chipDoneN">0</span>完成</span>
+            <span class="chip err"><span class="n" id="chipErrN">0</span>失败</span>
+          </div>
+          <span class="hint" id="queueState">暂无任务</span>
+          <button class="btn sm ghost" id="btnClearFinished" hidden>清空已完成</button>
+        </div>
+        <div class="ovrow">
+          <div class="ov-main">
+            <div class="ov-bar"><span id="ovBarInner"></span></div>
+            <div class="ov-meta"><span>队列总进度</span><b id="ovCount">0 / 0 份</b></div>
+          </div>
+        </div>
+        <div id="taskList" class="task-list"></div>
+        <div id="taskEmpty" class="empty">
+          <div class="em-ico">🗂</div>
+          <b>尚未添加解析任务</b>
+          <span class="esub">拖入文件或点击上方「开始解析」</span>
+        </div>
+      </section>
+    </div>
+
+    <!-- 拖拽手柄：调整右侧预览面板宽度 -->
+    <div class="gutter" id="gutterResize" role="separator" aria-orientation="vertical"
+         tabindex="0" aria-label="调整预览面板宽度" aria-keyshortcuts="ArrowLeft ArrowRight"
+         title="拖拽调整宽度，双击复位，聚焦后用 ←/→ 微调"></div>
+
+    <!-- ============ 右侧预览 / 设置抽屉 ============ -->
+    <aside class="aside" id="drawer">
+      <div class="ahead">
+        <div class="tabs">
+          <button id="tabPreview" type="button" class="on">预览</button>
+          <button id="tabSettings" type="button">设置</button>
+        </div>
+        <button class="x" id="btnCloseDrawer" title="关闭 (Esc)">✕</button>
+      </div>
+
+      <!-- 预览面板 -->
+      <div class="abody" id="dbodyPreview">
+        <div class="pv-empty" id="pvEmpty">点击任务卡片上的「预览」查看解析结果</div>
+        <div id="pvContent" class="pv-content" hidden>
+          <div class="pv-head">
+            <span class="pv-title" id="pvTitle">—</span>
+            <button class="btn sm" id="pvOpenDir">📂 打开目录</button>
+          </div>
+          <div class="pv-tabs">
+            <button type="button" class="on" data-view="md">Markdown</button>
+            <button type="button" data-view="json">JSON 结构</button>
+            <button type="button" data-view="images">图片</button>
+          </div>
+          <div class="pv-view" id="pvViewMd"><div class="md-box" id="pvMd"></div></div>
+          <div class="pv-view hidden" id="pvViewJson"><pre class="preview-json" id="pvJson"></pre></div>
+          <div class="pv-view hidden" id="pvViewImages"><div class="preview-imgs" id="pvImgs"></div></div>
+        </div>
+      </div>
+
+      <!-- 设置面板 -->
+      <div class="abody hidden" id="dbodySettings">
+        <div class="set-group">
+          <div class="gtitle">输出设置</div>
+          <div class="set-row"><label>输出根目录</label>
+            <div class="set-input-group">
+              <input id="setOutputDir" type="text" spellcheck="false"/>
+              <button class="btn sm" id="btnPickDir" title="用系统文件管理器选择目录">📁 浏览…</button>
+            </div>
+          </div>
+          <div class="set-hint">用系统文件管理器选择目录；默认 D:\MinerU-Output，所有批次文件均输出到该根目录下</div>
+          <div class="set-row"><label>打开输出目录</label><button class="btn sm" id="btnOpenRoot">打开文件夹</button></div>
+          <div class="set-hint">每批任务自动创建「日期_时间」或「日期_时间_名称」文件夹（名称可在提交时填写，事后也可重命名）；期间追加的文件归入同批；每个文件再单独建子目录</div>
+        </div>
+        <div class="set-group">
+          <div class="gtitle">导出内容</div>
+          <div class="fmt-grid">
+            <label class="fmt-item"><input type="checkbox" id="fmt_md"/><span>Markdown (.md)</span></label>
+            <label class="fmt-item"><input type="checkbox" id="fmt_middle_json"/><span>中间过程 JSON</span></label>
+            <label class="fmt-item"><input type="checkbox" id="fmt_model_output"/><span>模型原始输出</span></label>
+            <label class="fmt-item"><input type="checkbox" id="fmt_content_list"/><span>内容列表 JSON</span></label>
+            <label class="fmt-item"><input type="checkbox" id="fmt_images"/><span>图片</span></label>
+            <label class="fmt-item"><input type="checkbox" id="fmt_original_file"/><span>原始文件</span></label>
+          </div>
+          <div class="set-hint" style="margin-left:0;margin-top:8px">勾选决定该批次生成哪些文件，直接写入磁盘</div>
+        </div>
+        <div class="set-group">
+          <div class="gtitle">解析参数默认值</div>
+          <div class="set-row"><label>语言</label>
+            <select id="setParamLang">
+              <option value="ch">中文</option>
+              <option value="en">英文</option>
+              <option value="ja">日文</option>
+              <option value="ko">韩文</option>
+              <option value="auto">自动检测</option>
+            </select>
+          </div>
+          <div class="set-row"><label>引擎</label>
+            <select id="setParamBackend">
+              <option value="pipeline">Pipeline（快速）</option>
+              <option value="hybrid-engine">Hybrid（高精度）</option>
+            </select>
+          </div>
+          <div class="set-row"><label>推理强度</label>
+            <select id="setParamEffort">
+              <option value="high">高</option>
+              <option value="medium">中</option>
+              <option value="low">低</option>
+              <option value="none">无</option>
+            </select>
+          </div>
+          <div class="set-row"><label>最大页数</label><input id="setParamMaxPages" type="number" min="1" max="99999" step="1"/></div>
+          <div class="set-hint">超过该页数的文件将解析失败，默认 1000</div>
+          <div class="set-row"><label>识别选项</label>
+            <div class="set-chk">
+              <label class="sw"><input type="checkbox" id="setParamFormula"/>公式识别</label>
+              <label class="sw"><input type="checkbox" id="setParamTable"/>表格识别</label>
+              <label class="sw"><input type="checkbox" id="setParamImage"/>图像分析</label>
+              <label class="sw"><input type="checkbox" id="setParamOcr"/>强制 OCR</label>
+            </div>
+          </div>
+          <div class="set-hint">以上作为「文档解析」页面的初始参数；每次打开页面自动套用，提交时也可临时调整（不影响已保存的默认值）</div>
+        </div>
+        <div class="set-group">
+          <div class="gtitle">任务与资源</div>
+          <div class="set-row"><label>空闲释放引擎（秒）</label><input id="setIdle" type="number" min="5" max="3600" step="5"/></div>
+          <div class="set-hint">队列清空并闲置该时长后自动释放引擎、归还显存</div>
+          <div class="set-row"><label>批次关闭时间（秒）</label><input id="setBatchClose" type="number" min="10" max="86400" step="5"/></div>
+          <div class="set-hint">队列清空后闲置该时长，期间追加文件仍归入当前批次</div>
+        </div>
+        <button id="btnSaveSettings" class="btn primary savebtn">保存设置</button>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<!-- 通用确认弹窗 -->
+<div id="confirmModal" class="modal" hidden>
+  <div class="modal-mask"></div>
+  <div class="modal-box">
+    <h3 id="cfTitle">确认操作</h3>
+    <p id="cfMsg"></p>
+    <label class="sw cf-extra" id="cfExtraWrap" hidden>
+      <input type="checkbox" id="cfExtra"/><span id="cfExtraLabel"></span>
+    </label>
+    <div class="modal-actions">
+      <button class="btn ghost" id="cfCancel" type="button">取消</button>
+      <button class="btn danger" id="cfOk" type="button">确认</button>
+    </div>
+  </div>
+</div>
+
+<!-- 批次命名/重命名弹窗 -->
+<div id="renameModal" class="modal" hidden>
+  <div class="modal-mask"></div>
+  <div class="modal-box">
+    <h3 id="rnTitle">命名批次</h3>
+    <p class="rn-hint">将修改批次输出文件夹名称，示例：<span class="mono">2026-08-29_092823_社稳报告</span>；清空则仅用时间</p>
+    <input id="rnInput" class="rn-input" type="text" maxlength="60" spellcheck="false"
+           placeholder="批次名称（可留空 = 仅用时间戳）"/>
+    <div class="modal-actions">
+      <button class="btn ghost" id="rnCancel" type="button">取消</button>
+      <button class="btn primary" id="rnOk" type="button">确定</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/static/lib/markdown-it.min.js"></script>
+<script src="/static/lib/purify.min.js"></script>
+<script src="/static/lib/markdown-it-multimd-table.min.js"></script>
+<script src="/static/lib/highlight.min.js"></script>
+<script src="/static/lib/katex/katex.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
