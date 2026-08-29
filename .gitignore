@@ -27,6 +27,12 @@ dist/
 mineru.json
 service.log
 
+# ===== TRAE HTML 分享包（临时产物） =====
+.trae-html-share-packages/
+
+# ===== 已过时的本地规范副本（规范已迁移到独立仓库 repo-management-spec） =====
+docs/remote-repo-management-spec/
+
 # ===== IDE / 系统 =====
 .idea/
 .vscode/
