@@ -22,7 +22,6 @@
     </div>
     <div class="top-right">
       <span class="pill"><span class="dot idle" id="engineDot"></span><span id="engineText">引擎空闲</span></span>
-      <span class="pill stage" id="engineStage" hidden></span>
       <span class="pill batch" title="当前批次目录">批次 <span class="mono" id="topBatch">—</span></span>
       <button class="btn sm" id="btnSettings" type="button">⚙ 输出设置</button>
       <button class="btn primary sm" id="btnOpenOutput" type="button">📂 打开输出目录</button>
@@ -295,6 +294,8 @@
           <div class="set-hint">队列清空并闲置该时长后自动释放引擎、归还显存</div>
           <div class="set-row"><label>批次关闭时间（秒）</label><input id="setBatchClose" type="number" min="10" max="86400" step="5"/></div>
           <div class="set-hint">队列清空后闲置该时长，期间追加文件仍归入当前批次</div>
+          <div class="set-row"><label>下载线程数</label><input id="setDlThreads" type="number" min="4" max="64" step="1"/></div>
+          <div class="set-hint">模型与更新文件的多源下载线程数，默认 16，范围 4-64</div>
         </div>
         <button id="btnSaveSettings" class="btn primary savebtn">保存设置</button>
       </div>

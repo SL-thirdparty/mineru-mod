@@ -1,11 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 # MinerU 托盘启动器打包配置（onedir / 窗口模式）
-# 构建命令：
-#   venv\Scripts\python.exe -m PyInstaller --clean --noconfirm --distpath . --workpath .tmp\pyinstaller\build mineru_tray.spec
+# 构建命令（工作目录须为项目根）：
+#   runtime\venv\Scripts\python.exe -m PyInstaller --clean --noconfirm --distpath release --workpath .tmp\pyinstaller\build scripts\mineru_tray.spec
+
+import os
+
+# spec 位于 scripts/，上推一级得到项目根
+ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(SPEC)), ".."))
 
 a = Analysis(
-    ["tray/mineru_tray.py"],
-    pathex=[],
+    [os.path.join(ROOT, "src", "tray", "mineru_tray.py")],
+    pathex=[ROOT],
     binaries=[],
     datas=[],
     hiddenimports=[
@@ -42,7 +47,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=[".tmp/pyinstaller/icon.ico"],
+    icon=[os.path.join(ROOT, "src", "tray", "icon.ico")],
 )
 
 coll = COLLECT(

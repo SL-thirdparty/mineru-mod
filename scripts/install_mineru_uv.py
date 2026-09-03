@@ -14,9 +14,13 @@
 import ctypes
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+
+# GUI（pythonw/打包 exe，无控制台）启动子进程时避免弹出黑色控制台窗口
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 _ANSI = False
 
@@ -41,6 +45,15 @@ def enable_vt():
 _ANSI = enable_vt()
 LOG = None
 
+# 管道/重定向下 stdout 走 locale(GBK)，✓ 等字符会抛 UnicodeEncodeError；
+# 统一 UTF-8 输出（安装器 GUI 端按 UTF-8 解码）。独立终端运行不受影响。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        if _s and _s.encoding and _s.encoding.lower().replace("-", "") != "utf8":
+            _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def c(s, code):
     return f"\x1b[{code}m{s}\x1b[0m" if _ANSI else s
@@ -64,13 +77,76 @@ def emit(s=""):
         pass
 
 
+def _log_raw(s):
+    """仅写入日志文件（不在终端/GUI 输出）。"""
+    try:
+        LOG.write(s + "\n")
+        LOG.flush()
+    except Exception:
+        pass
+
+
+# GUI 结构化事件模式：install_flow 置 True 后，uv/pip 输出被翻译成
+# "[pkg] 动作|参数|参数" 事件行，供安装器 GUI 显示逐包下载进度。
+GUI_EVENTS = False
+
+_NOISE_HEADS = ("INFO ", "DEBUG ", "TRACE ", "WARN ")
+_RE_UV_DOWN = re.compile(r"^Downloading (\S+) \(([\d.]+\s*[KMG]i?B)\)$")
+_RE_UV_CNT = re.compile(r"^(?:Resolved|Prepared|Installed|Audited) (\d+) packages?(?: in ([\d.]+m?s)?)?")
+_RE_UV_INSTALLED = re.compile(r"^Installed (\d+) packages? in ([\d.]+m?s)$")
+_RE_PIP_WHL = re.compile(r"^Downloading (\S+\.whl) \(([\d.]+\s*[KM]B)\)$")
+_RE_PIP_COLLECT = re.compile(r"^Collecting ([A-Za-z0-9_.\[\]-]+)")
+_RE_PIP_OK = re.compile(r"^Successfully installed (.+)$")
+
+
+def _translate_uv(line):
+    """uv/pip 输出单行 → (事件行 或 None, 是否噪音)。
+    事件行：down|包名|大小 / resolved|总数|耗时 / prepared|数|耗时 / installed|数|耗时
+    噪音行：解析器 INFO 调试、无大小的重复 Downloading、"+ name==ver" 明细——只入日志文件。"""
+    s = line.strip()
+    if not s:
+        return None, False
+    if s.startswith(_NOISE_HEADS):
+        return None, True
+    m = _RE_PIP_WHL.match(s)
+    if m:  # pip 回退：Downloading torch-2.11.0-...whl (900.5 MB)
+        # 必须先于 _RE_UV_DOWN：后者同样能匹配 whl 行，会把整段文件名当包名
+        return f"down|{m.group(1).split('-')[0]}|{m.group(2)}", False
+    m = _RE_UV_DOWN.match(s)
+    if m:
+        return f"down|{m.group(1)}|{m.group(2)}", False
+    m = _RE_UV_INSTALLED.match(s)
+    if m:
+        return f"installed|{m.group(1)}|{m.group(2)}", False
+    m = _RE_UV_CNT.match(s)
+    if m:  # Resolved N packages in Xs / Prepared N in Xs / Audited N
+        act = "resolved" if s.startswith("Resolved") else (
+            "prepared" if s.startswith("Prepared") else "installed")
+        return f"{act}|{m.group(1)}|{m.group(2) or ''}", False
+    m = _RE_PIP_COLLECT.match(s)
+    if m:
+        return "down|%s|" % m.group(1).split("==")[0].split(">=")[0].split("<")[0], False
+    m = _RE_PIP_OK.match(s)
+    if m:
+        return f"installed|{len(m.group(1).split())}|", False
+    # uv 无大小的重复 Downloading 行（进度条残迹）与 + name==ver 明细
+    if re.match(r"^Downloading \S+$", s) or s.startswith("+ ") or s.startswith("- "):
+        return None, True
+    return None, False
+
+
 def run_tee(cmd):
     """执行命令，逐行实时打印到终端并写入日志；返回退出码。"""
     emit(f"$ {' '.join(cmd)}")
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, errors="replace")
+                         text=True, errors="replace", creationflags=_NO_WINDOW)
     for line in p.stdout:
-        emit(line.rstrip())
+        raw = line.rstrip("\n")
+        _event, noise = _translate_uv(raw)
+        if noise:
+            _log_raw(raw)
+        else:
+            emit(raw)
     return p.wait()
 
 
@@ -78,12 +154,21 @@ def run_visible(cmd, tee):
     """统一走管道捕获：uv/pip 的 stdout+stderr 实时回显到终端并写入日志。
     取舍：虽然 TTY 下 uv/pip 的原生动画进度条因此退化为逐行文本（每行仍含包名/大小），
     但失败原因不再丢失——实体机上无法装通 torch 时，报错能完整落盘供回传定位，比进度条更关键。
-    保留 tee 形参以兼容所有调用点，实际恒为管道模式。"""
+    保留 tee 形参以兼容所有调用点，实际恒为管道模式。
+    GUI 模式下（GUI_EVENTS=True，由 install_flow 设置）：逐行翻译成 [pkg] 事件，
+    供 GUI 实时显示「正在下载 xx 包（大小）· 第 N/M 个」。"""
     emit(f"$ {' '.join(cmd)}")
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, errors="replace")
+                         text=True, errors="replace", creationflags=_NO_WINDOW)
     for line in p.stdout:
-        emit(line.rstrip())
+        raw = line.rstrip("\n")
+        event, noise = _translate_uv(raw)
+        if noise:
+            _log_raw(raw)
+        elif event and GUI_EVENTS:
+            emit(f"[pkg] {event}")
+        else:
+            emit(raw)
     return p.wait()
 
 
@@ -115,7 +200,8 @@ def _find_nvidia_smi():
               r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.bat"):
         cands.append(p)
     try:
-        r = subprocess.run(["where", "nvidia-smi"], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(["where", "nvidia-smi"], capture_output=True, text=True,
+                           timeout=30, errors="replace", creationflags=_NO_WINDOW)
         if r.returncode == 0:
             for ln in r.stdout.splitlines():
                 ln = ln.strip()
@@ -156,7 +242,8 @@ def detect_gpu():
             try:
                 r = subprocess.run(
                     [probe] + ["--query-gpu=" + ",".join(qfields), "--format=csv,noheader"],
-                    capture_output=True, text=True, timeout=30)
+                    capture_output=True, text=True, timeout=30, errors="replace",
+                    creationflags=_NO_WINDOW)
             except Exception:
                 continue
             if r.returncode != 0 or not r.stdout.strip():
@@ -197,7 +284,8 @@ def _wmi_nvidia_gpu():
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }"],
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, timeout=60, errors="replace",
+            creationflags=_NO_WINDOW)
         lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
         for ln in lines:
             low = ln.lower()
@@ -209,11 +297,20 @@ def _wmi_nvidia_gpu():
 
 
 # CUDA torch wheel 索引：国内镜像优先 -> 官方回退。cuX 由驱动 CUDA 版本决定后填充
+# 顺序按实测速度排序（2026-09 实测）：上交大 ~9MB/s、官方 ~10MB/s、阿里云 ~2.8MB/s、中科大部分版本缺失
 PYTORCH_INDEXES = [
+    "https://mirror.sjtu.edu.cn/pytorch-wheels/{cu}",
+    "https://download.pytorch.org/whl/{cu}",
     "https://mirrors.aliyun.com/pytorch-wheels/{cu}",
     "https://mirrors.ustc.edu.cn/pytorch-wheels/{cu}",
-    "https://download.pytorch.org/whl/{cu}",
 ]
+
+# torch/torchvision CUDA wheel 文件名模板（cp311 / win_amd64，与 finalize_torch
+# 联网回退安装的版本一致）；供安装器预下载与 download_torch_wheels.py 共用
+TORCH_WHEELS = {
+    "torch": "torch-2.11.0+{cu}-cp311-cp311-win_amd64.whl",
+    "torchvision": "torchvision-0.26.0+{cu}-cp311-cp311-win_amd64.whl",
+}
 
 
 def pick_cuda(driver_cuda):
@@ -317,9 +414,11 @@ def _log_tail(path, n=18):
 
 
 PIP_MIRRORS = [
-    "https://pypi.tuna.tsinghua.edu.cn/simple",
+    # 实测 2026-09-02 起清华源对本机 403（uv 与裸 HTTP 均 403），阿里云/中科大正常；
+    # 清华降级为第三备选，保留以便其它网络环境使用。
     "https://mirrors.aliyun.com/pypi/simple/",
     "https://pypi.mirrors.ustc.edu.cn/simple",
+    "https://pypi.tuna.tsinghua.edu.cn/simple",
     None,  # 官方 pypi.org，最终兜底
 ]
 
@@ -350,18 +449,49 @@ class Installer:
         self.mirror = mirror
         self.diag = diag
         self.local_torch_dir = local_torch_dir and os.path.abspath(local_torch_dir)
-        self.venv = os.path.join(root, "venv")
+        self.venv = os.path.join(root, "runtime", "venv")
         self.vpy = os.path.join(self.venv, "Scripts", "python.exe")
         self.uv = find_uv()
+        self._mirror_order = None   # 测速后源序（None=未测速，用固定优先序）
 
     def mirror_sources(self):
+        if self._mirror_order:
+            return list(self._mirror_order)
         if self.mirror:
             return [self.mirror] + [s for s in PIP_MIRRORS if s != self.mirror]
         return list(PIP_MIRRORS)
 
+    def probe_mirrors(self):
+        """并发测速 pypi 镜像（读 torch 索引页 ~1MB，约 5s），按速度重排源序。
+        用户 --mirror 仍置顶；全部不可达回退固定优先序（绝不因此中止）。"""
+        try:
+            import fastdl
+        except ImportError:
+            return
+        cands = [s for s in self.mirror_sources() if s]
+        if len(cands) < 2:
+            return
+        emit(cyan("       [测速] 并发测试 %d 个安装源（约 5s）..." % len(cands)))
+        ranked = fastdl.probe(cands, lambda s: s.rstrip("/") + "/simple/torch/",
+                             probe_bytes=1 << 20, window=5.0, timeout=8)
+        if not ranked:
+            emit(yellow("       [测速] 均不可达，保持默认源序"))
+            return
+        for name, mbps in ranked:
+            emit("       [测速] %-44s %s" % (name, "%.1f MB/s" % mbps if mbps > 0 else "不可达"))
+        order = [n for n, v in ranked if v > 0]
+        order += [s for s in cands if s not in order]   # 0 分源沉底保留（回退候选）
+        order += [s for s in self.mirror_sources() if s is None]  # 官方兜底恒末位
+        if self.mirror and self.mirror in order:        # 用户显式指定仍置顶
+            order.remove(self.mirror)
+            order.insert(0, self.mirror)
+        self._mirror_order = order
+        if order and order[0]:
+            emit(green("       [测速] 最快源：%s" % order[0]))
+
     # ---- 步骤 1：校验模型目录 ----
     def check_model(self):
-        cache = os.path.join(self.root, "models_cache")
+        cache = os.path.join(self.root, "runtime", "models_cache")
         kit = os.path.join(cache, "models", "OpenDataLab--PDF-Extract-Kit-1.0", "snapshots", "master")
         # VLM（hybrid 后端）模型未预置 → 若误用 hybrid 会现场联网下载 1.2B 模型导致慢
         vlm_dirs = [
@@ -394,13 +524,17 @@ class Installer:
             shutil.rmtree(self.venv, ignore_errors=True)
         emit(cyan("[2/4] 创建虚拟环境 venv ..."))
         if self.uv:
-            if run_tee([self.uv, "venv", self.venv]) == 0:
+            # 必须显式 --python：否则 uv 用它自己找到的默认解释器（实测在装了多版本
+            # Python 的机器上选了 3.10），导致 venv 与流程校验过的 3.11 不一致、
+            # cp311 离线 torch wheel 无法安装。
+            if run_tee([self.uv, "venv", "--python", sys.executable, self.venv]) == 0:
                 return True
             emit(yellow("       ↻ uv 建 venv 失败，回退 python -m venv"))
         return run_tee([sys.executable, "-m", "venv", self.venv]) == 0
 
-    # ---- 步骤 3：安装依赖（uv 优先 -> pip 兜底，镜像多源回退）----
+    # ---- 步骤 3：安装依赖（uv 优先 -> pip 兜底，镜像测速排序 + 多源回退）----
     def install_deps(self):
+        self.probe_mirrors()
         specs = ["mineru[core]", "pywin32", "pystray"]
         if self.uv:
             if self._install_with_uv(specs):
@@ -438,6 +572,39 @@ class Installer:
         emit(red("       错误：所有安装源均失败"))
         return False
 
+    def _pip_install_cmd(self, pip_args):
+        """pip 风格安装参数 → 实际命令行（uv 优先）。
+        uv 建的 venv 没有 pip（实测 No module named pip 且 ensurepip 也不可用），
+        故 uv 可用时一律走 `uv pip install --python <vpy>`；uv 不可用时 venv 必然由
+        `python -m venv` 创建（自带 pip），直接走原生 pip。
+        pip 独有参数自动适配：--force-reinstall→--reinstall；--prefer-binary/--timeout/
+        --retries 为 uv 不支持的参数，连同取值一并剔除。"""
+        if not self.uv:
+            return [self.vpy, "-m", "pip", "install"] + pip_args
+        uv_args, drop_next = [], False
+        for a in pip_args:
+            if drop_next:
+                drop_next = False
+                continue
+            if a == "--force-reinstall":
+                uv_args.append("--reinstall")
+            elif a == "--prefer-binary":
+                continue
+            elif a in ("--timeout", "--retries"):
+                drop_next = True
+            else:
+                uv_args.append(a)
+        cmd = [self.uv, "pip", "install", "--python", self.vpy]
+        if not TTY:
+            cmd += ["--no-progress", "--color", "never"]
+        return cmd + uv_args
+
+    def _pip_uninstall_cmd(self, pkgs):
+        """pip uninstall 的 uv/pip 双引擎命令行（uv 建的 venv 无 pip，同上）。"""
+        if self.uv:
+            return [self.uv, "pip", "uninstall", "--python", self.vpy] + list(pkgs)
+        return [self.vpy, "-m", "pip", "uninstall", "-y"] + list(pkgs)
+
     def torch_offline_install(self):
         """从本地目录离线安装 CUDA torch（--local-torch-dir 提供，通常为 aria2 预下载的 wheel）。
         用 --no-index --find-links 只查该目录，杜绝联网；返回 (ok, info2)。"""
@@ -452,10 +619,10 @@ class Installer:
             return False, None
         emit(cyan("       [torch 离线] 检测到本地 wheel %d 个，跳过联网直接从目录安装" % len(wheels)))
         self.diag.w("离线安装目录: %s ; wheels=%s" % (d, ", ".join(sorted(wheels))))
-        rc = run_visible([self.vpy, "-m", "pip", "install",
-                          "--no-index", "--find-links", d,
-                          "--force-reinstall", "--no-deps",
-                          "torch", "torchvision"], not TTY)
+        rc = run_visible(self._pip_install_cmd(
+                          ["--no-index", "--find-links", d,
+                           "--force-reinstall", "--no-deps",
+                           "torch", "torchvision"]), not TTY)
         info2 = self.torch_info()
         avail = bool(info2 and info2.get("avail"))
         self.diag.w("  → 离线 rc=%s avail=%s torch=%s" % (rc, avail,
@@ -470,7 +637,8 @@ class Installer:
     def torch_info(self):
         code = "import torch,json;d={'ver':torch.__version__,'cuda_built':(torch.version.cuda),'avail':torch.cuda.is_available(),'dev':torch.cuda.device_count() if torch.cuda.is_available() else 0};print(json.dumps(d))"
         try:
-            r = subprocess.run([self.vpy, "-c", code], capture_output=True, text=True, timeout=90)
+            r = subprocess.run([self.vpy, "-c", code], capture_output=True, text=True,
+                               timeout=90, errors="replace", creationflags=_NO_WINDOW)
             out = r.stdout.strip()
             if r.returncode == 0 and out:
                 return json.loads(out.splitlines()[-1])
@@ -486,7 +654,8 @@ class Installer:
                 "try:\n ort.preload_dlls()\nexcept Exception:\n pass\n"
                 "print(json.dumps({'ver': ort.__version__,'cuda':'CUDAExecutionProvider' in ort.get_available_providers()}))")
         try:
-            r = subprocess.run([self.vpy, "-c", code], capture_output=True, text=True, timeout=90)
+            r = subprocess.run([self.vpy, "-c", code], capture_output=True, text=True,
+                               timeout=90, errors="replace", creationflags=_NO_WINDOW)
             out = r.stdout.strip()
             if r.returncode == 0 and out:
                 import json
@@ -508,8 +677,9 @@ class Installer:
             self.diag.w("onnxruntime: 探测失败（可能未安装）→ 尝试安装 onnxruntime-gpu")
             emit(cyan("       [onnxruntime] 探测失败（可能未安装）→ 正在安装 onnxruntime-gpu..."))
         # 避免与 uv 注入的 CPU 版 onnxruntime 冲突：先卸载两者再装 gpu，确保 import 取到 GPU provider
-        subprocess.run([self.vpy, "-m", "pip", "uninstall", "-y", "onnxruntime", "onnxruntime-gpu"],
-                       capture_output=True, text=True, timeout=120)
+        subprocess.run(self._pip_uninstall_cmd(["onnxruntime", "onnxruntime-gpu"]),
+                       capture_output=True, text=True, timeout=120, errors="replace",
+                       creationflags=_NO_WINDOW)
         emit("       [onnxruntime] 已卸载 CPU 版 onnxruntime → 装 gpu 版")
         self.diag.w("已卸载 onnxruntime/onnxruntime-gpu（防双包冲突）")
         # 关键：版本匹配 torch cu128 → onnxruntime-gpu < 1.27（1.27+默认 CUDA 13，不兼容；1.21-1.26 对应 CUDA 12.8）
@@ -518,18 +688,18 @@ class Installer:
         for src in self.mirror_sources():
             emit("       [源] %s (%s)" % ((src or "官方 pypi.org"), spec))
             self.diag.w("尝试 onnxruntime-gpu from %s 限定 %s" % ((src or "官方"), spec))
-            cmd = [self.vpy, "-m", "pip", "install", "--prefer-binary",
-                   "--timeout", "180", "--retries", "3"]
+            args = ["--prefer-binary", "--timeout", "180", "--retries", "3"]
             if src:
-                cmd += ["-i", src]
-            cmd.append(spec)
-            rc = run_visible(cmd, not TTY)
+                args += ["-i", src]
+            args.append(spec)
+            rc = run_visible(self._pip_install_cmd(args), not TTY)
             if rc == 0:
                 # 安装完重探一次（同样先 preload torch 的 CUDA/cuDNN DLL）
                 code2 = ("import torch,onnxruntime as ort,json\n"
                         "try:\n ort.preload_dlls()\nexcept Exception:\n pass\n"
                         "print(json.dumps({'ver': ort.__version__,'cuda':'CUDAExecutionProvider' in ort.get_available_providers()}))")
-                r = subprocess.run([self.vpy, "-c", code2], capture_output=True, text=True, timeout=90)
+                r = subprocess.run([self.vpy, "-c", code2], capture_output=True, text=True,
+                                   timeout=90, errors="replace", creationflags=_NO_WINDOW)
                 out2 = r.stdout.strip()
                 if r.returncode == 0 and out2:
                     d2 = json.loads(out2.splitlines()[-1])
@@ -580,16 +750,6 @@ class Installer:
             self.diag.w("决策: 有独显但 torch=CPU → 重装 %s" % cu)
             if LOG:
                 LOG.flush()
-            # 依赖走 uv 安装时，venv 内可能没有 pip（实测出现 No module named pip，三个源全 rc=1）；
-            # torch/onnxruntime-gpu 重装依赖 pip，故先用 stdlib 自带 ensurepip 补回。
-            _ensure = subprocess.run([self.vpy, "-m", "ensurepip", "--upgrade"],
-                                     capture_output=True, text=True, timeout=180)
-            if _ensure.returncode == 0:
-                emit("       [pip] venv 已补齐 pip（ensurepip）")
-                self.diag.w("ensurepip: ok (venv pip 已补齐)")
-            else:
-                emit(yellow("       [警告] ensurepip 失败: " + (_ensure.stderr.strip()[:200] or _ensure.stdout.strip()[:200])))
-                self.diag.w("ensurepip: 失败 " + (_ensure.stderr.strip()[:200] or ""))
             ok_torch = False
             # 优先用本地预下载的 wheel（aria2 多线程拉起、免联网），失败再走镜像→官方联网
             if self.local_torch_dir:
@@ -613,11 +773,11 @@ class Installer:
                 for idx in idxs:
                     emit("       [torch 源] " + idx)
                     self.diag.w("尝试 CUDA torch 源: " + idx)
-                    rc = run_visible([self.vpy, "-m", "pip", "install", "--prefer-binary",
-                                  "--force-reinstall", "--no-deps",
-                                  "--timeout", "180", "--retries", "3",
-                                  "--index-url", idx,
-                                  "torch", "torchvision"], not TTY)
+                    rc = run_visible(self._pip_install_cmd(
+                                  ["--prefer-binary", "--force-reinstall", "--no-deps",
+                                   "--timeout", "180", "--retries", "3",
+                                   "--index-url", idx,
+                                   "torch", "torchvision"]), not TTY)
                     info2 = self.torch_info()
                     avail = bool(info2 and info2.get("avail"))
                     self.diag.w("  → rc=%s avail=%s torch=%s" % (rc, avail,
@@ -648,7 +808,7 @@ class Installer:
     # ---- 步骤 4：生成 mineru.json ----
     def write_config(self):
         emit(cyan("[4/4] 生成 mineru.json 指向模型目录 ..."))
-        cache = os.path.join(self.root, "models_cache")
+        cache = os.path.join(self.root, "runtime", "models_cache")
         kit = os.path.join(cache, "models", "OpenDataLab--PDF-Extract-Kit-1.0", "snapshots", "master")
         base = kit if os.path.isdir(kit) else cache
         cfg = {"models-dir": {"pipeline": base.replace("\\", "/")}, "model-source": "modelscope"}
@@ -673,7 +833,7 @@ def main():
             local_torch_dir = sys.argv[i + 1]
     # 未显式指定时，自动探测同目录下的约定离线目录 torch_wheels，双击 bat 也能命中
     if not local_torch_dir:
-        default_cand = os.path.join(root, "torch_wheels")
+        default_cand = os.path.join(root, "runtime", "torch_wheels")
         if os.path.isdir(default_cand) and any(
                 f.lower().endswith(".whl") and (f.lower().startswith("torch") or f.lower().startswith("torchvision"))
                 for f in os.listdir(default_cand)):

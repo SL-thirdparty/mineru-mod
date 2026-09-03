@@ -65,10 +65,6 @@ button{font-family:var(--sans)}
 @keyframes pulse{0%,100%{box-shadow:0 0 0 3px rgba(15,157,90,.15)}50%{box-shadow:0 0 0 5px rgba(15,157,90,.05)}}
 @keyframes pulseAmber{0%,100%{box-shadow:0 0 0 3px rgba(245,166,35,.18)}50%{box-shadow:0 0 0 6px rgba(245,166,35,.05)}}
 .pill.batch .mono{font-weight:600;color:var(--brand-ink);max-width:210px;overflow:hidden;text-overflow:ellipsis}
-.pill.stage{
-  border-style:dashed;color:var(--warn);background:var(--warn-bg);border-color:var(--warn-line);
-  max-width:300px;overflow:hidden;text-overflow:ellipsis;
-}
 .btn{
   display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line-2);background:var(--surface);
   color:var(--ink);border-radius:8px;padding:6px 14px;font-size:12.5px;cursor:pointer;
@@ -407,21 +403,59 @@ button{font-family:var(--sans)}
 /* 代码高亮（highlight.js github 主题） */
 .md-box .hljs{background:#f8f9fb}
 
-/* 阶段指示条（单文件 8 步生命周期） */
-.stagebar{display:flex;align-items:center;gap:4px;margin-top:7px;flex-wrap:wrap}
-.stagebar .st-item{
-  display:inline-flex;align-items:center;gap:4px;font-size:10.5px;color:var(--ink-3);
-  background:var(--surface);border:1px solid var(--line);border-radius:999px;
-  padding:1px 8px;line-height:16px;white-space:nowrap;
+/* 阶段点进度条：节点圆点直接画在进度条上，填充逐点推进（开始解析→…→结果整理） */
+.progline.np{flex-direction:column;align-items:stretch;gap:0;width:100%}
+.spbar{position:relative;height:10px;background:var(--line);border-radius:999px;margin:8px 30px 0}
+.spbar .sp-fill{
+  position:absolute;left:0;top:0;bottom:0;min-width:8px;border-radius:999px;
+  background:linear-gradient(90deg,var(--brand),#6d8bff);transition:width .5s ease;
 }
-.stagebar .st-item i{width:6px;height:6px;border-radius:50%;background:#d3d9e3}
-.stagebar .st-item.done{color:var(--ok);border-color:var(--ok-line);background:var(--ok-bg)}
-.stagebar .st-item.done i{background:var(--ok)}
-.stagebar .st-item.cur{color:var(--brand-ink);border-color:var(--brand);background:var(--brand-soft);font-weight:700}
-.stagebar .st-item.cur i{background:var(--brand);animation:pulse 1.3s infinite}
-.stagebar .st-item.todo{opacity:.55}
-.stage-eng{font-size:11px;color:var(--ink-2);margin-top:5px;display:flex;align-items:center;gap:5px}
-.stage-eng b{color:var(--warn);font-weight:600}
+.spbar.indet .sp-fill{
+  background:linear-gradient(90deg,var(--brand),#8fa6ff,var(--brand));
+  background-size:200% 100%;animation:spFlow 1.5s linear infinite;
+}
+@keyframes spFlow{0%{background-position:0 0}100%{background-position:200% 0}}
+.spbar .sp-dot{
+  position:absolute;top:50%;width:13px;height:13px;margin:-6.5px 0 0 -6.5px;border-radius:50%;
+  background:var(--surface);border:2px solid var(--line-2);box-sizing:border-box;z-index:2;transition:.25s;
+}
+.spbar .sp-dot.done{background:var(--brand);border-color:#fff;box-shadow:0 0 0 2px var(--brand)}
+.spbar .sp-dot.cur{border-color:var(--brand);background:var(--surface);animation:spPulse 1.4s infinite}
+@keyframes spPulse{0%,100%{box-shadow:0 0 0 0 rgba(46,91,255,0)}50%{box-shadow:0 0 0 6px rgba(46,91,255,.16)}}
+.sp-labels{position:relative;height:17px;margin:4px 30px 0}
+.sp-labels span{
+  position:absolute;transform:translateX(-50%);font-size:10px;line-height:17px;
+  color:var(--ink-3);white-space:nowrap;
+}
+.sp-labels span.done{color:var(--brand-ink);font-weight:600}
+/* 活跃阶段标签：胶囊高亮 + 数量（如"文字识别 12/186"），提升层级防与相邻标签重叠 */
+.sp-labels span.cur{
+  color:var(--brand);font-weight:700;z-index:3;
+  padding:0 6px;margin-top:-1px;border-radius:999px;background:var(--surface);
+  box-shadow:0 0 0 1px var(--brand);
+}
+.sp-labels span.cur b{font-weight:800}
+/* 阶段标签 hover 气泡：显示该阶段的具体描述（来自 data-desc），浅浮在进度条上方 */
+.sp-labels span{cursor:help}
+.sp-labels span::after{
+  content:attr(data-desc);position:absolute;left:50%;bottom:calc(100% + 7px);
+  transform:translateX(-50%) translateY(4px);padding:5px 9px;border-radius:6px;
+  background:rgba(20,26,38,.94);color:#fff;font-size:11px;line-height:1.5;
+  white-space:nowrap;opacity:0;visibility:hidden;pointer-events:none;z-index:60;
+  box-shadow:0 4px 14px rgba(0,0,0,.22);transition:opacity .16s,transform .16s;
+}
+.sp-labels span:hover::after{opacity:1;visibility:visible;transform:translateX(-50%) translateY(0)}
+/* 末节点气泡靠右对齐，防止右侧超出容器 */
+.sp-labels span:last-child::after{transform:translateX(-96%) translateY(4px)}
+.sp-labels span:last-child:hover::after{transform:translateX(-96%) translateY(0)}
+/* 完成态：全部点 + 填充转完成绿，与解析中样式统一 */
+.spbar.ok .sp-fill{background:linear-gradient(90deg,var(--ok),#3ddc7f)}
+.spbar.ok .sp-dot.done{background:var(--ok);border-color:#fff;box-shadow:0 0 0 2px var(--ok)}
+.spbar.ok .sp-lb.done{color:var(--ok)}
+.progline.np .ptxt{display:flex;align-items:baseline;gap:4px;line-height:1.4;margin-top:2px}
+.progline.np .np-pct{color:var(--brand-ink);font-weight:700}
+.progline.np .np-total{color:var(--ink-3);font-weight:400}
+.progline.np .ptxt.ok{color:var(--ok);font-weight:600}
 .preview-json{
   border:1px solid var(--line);border-radius:9px;background:var(--surface-2);padding:14px;
   font-family:var(--mono);font-size:11px;color:#0f766e;line-height:1.7;white-space:pre-wrap;word-break:break-word;

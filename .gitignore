@@ -4,13 +4,8 @@ __pycache__/
 *.egg-info/
 *.log
 
-# ===== 虚拟环境 / 依赖包 =====
-venv/
-models_cache/
-torch_wheels/
-
-# ===== 运行数据（上传 / 输出 / 日志 / 模型 / 运行配置） =====
-_data/
+# ===== 运行时（venv / 模型 / wheel / 数据，统一在 runtime/ 下，不入库） =====
+runtime/
 
 # ===== AI 临时工作区 =====
 .tmp/
@@ -29,6 +24,12 @@ service.log
 
 # ===== TRAE HTML 分享包（临时产物） =====
 .trae-html-share-packages/
+
+# ===== 发布产物（由 dist 分支承载，不入 main） =====
+release/
+
+# ===== 本机 GitHub 账户管理方案（私人文档，勿入库） =====
+docs/remote-repo-management-plan.md
 
 # ===== 已过时的本地规范副本（规范已迁移到独立仓库 repo-management-spec） =====
 docs/remote-repo-management-spec/

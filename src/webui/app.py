@@ -37,15 +37,98 @@ from mineru.cli.api_client import (
 from mineru.cli.common import normalize_task_stem
 
 # ---------------- 基础路径 ----------------
-ROOT = Path(__file__).resolve().parent.parent          # MinerU 根目录
-DATA = ROOT / "_data"
+# MinerU 根目录：优先取 MINERU_ROOT（托盘/安装器启动时注入），
+# 否则由源码位置推导（src/webui/app.py -> 上两级为项目根）。
+ROOT = Path(os.environ.get("MINERU_ROOT") or Path(__file__).resolve().parent.parent.parent)
+RUNTIME = ROOT / "runtime"                     # 运行时：venv / 模型 / 数据 / wheel
+DATA = RUNTIME / "_data"
 UPLOADS = DATA / "uploads"
 OUTPUTS = DATA / "outputs"
 STATIC = Path(__file__).resolve().parent / "static"
 CONFIG_JSON = ROOT / "mineru.json"
+MODEL_CACHE = RUNTIME / "models_cache"
 
 UPLOADS.mkdir(parents=True, exist_ok=True)
 OUTPUTS.mkdir(parents=True, exist_ok=True)
+
+# ---------------- 运行日志（每次运行清空之前的日志） ----------------
+# 日志目录默认取 exe 所在目录下的 logs（托盘启动时经 MINERU_LOG_DIR 传入），
+# 否则回退到项目根 logs；每次运行新建一份日志并清空历史。
+# 双日志分离，避免日志杂乱：
+#   1) 主业务日志 logs/MinerU_日期_时间.log —— WebUI 结构化业务事件（供人阅读）；
+#   2) 引擎原始日志 logs/MinerU_日期_时间_engine.log —— 引擎子进程 stdout/stderr
+#      原样落盘（loguru + tqdm 阶段进度），供阶段跟踪解析与深排障。
+#      uvicorn 访问日志已关闭（access_log=False），不掺入任何一份日志。
+APP_LOG_NAME = "MinerU"
+_CUR_LOG_PATH = None        # 主业务日志路径（本进程内解析一次）
+_BIZ_LOCK = threading.Lock()
+_BIZ_HANDLE = None          # 主业务日志文件句柄（biz_log 专用，独立于 fd 重定向）
+
+
+def _logs_dir():
+    d = os.environ.get("MINERU_LOG_DIR")
+    if d:
+        return Path(d)
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "logs"
+    return DATA / "logs"   # runtime/_data/logs，日志随运行态存放
+
+
+def _clean_old_logs(logs_dir):
+    """每次运行清空之前日志：删除 logs 目录下本软件历史运行日志（含引擎原始日志）。"""
+    try:
+        for p in logs_dir.glob(f"{APP_LOG_NAME}_*.log"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _resolve_log_path():
+    """主业务日志路径（本进程内解析一次，供 biz_log 写入与引擎日志派生）。"""
+    global _CUR_LOG_PATH
+    if _CUR_LOG_PATH is not None:
+        return _CUR_LOG_PATH
+    f = os.environ.get("MINERU_LOG_FILE")
+    if f:
+        _CUR_LOG_PATH = Path(f)
+        return _CUR_LOG_PATH
+    logs_dir = _logs_dir()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _clean_old_logs(logs_dir)
+    _CUR_LOG_PATH = logs_dir / f"{APP_LOG_NAME}_{time.strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    return _CUR_LOG_PATH
+
+
+def _engine_log_path():
+    """引擎原始日志路径：主业务日志同名加 _engine 后缀（MinerU_日期_时间_engine.log）。"""
+    f = os.environ.get("MINERU_ENGINE_LOG_FILE")
+    if f:
+        return Path(f)
+    base = _resolve_log_path()
+    return base.with_name(base.stem + "_engine" + base.suffix)
+
+
+def biz_log(level, msg, **fields):
+    """写主业务日志（供人阅读）：`时间 | 级别 | 事件 | k=v ...`。
+    独立于 fd 重定向的引擎原始日志，保证可读性、不被引擎/tqdm 噪音淹没。"""
+    global _BIZ_HANDLE
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        extra = "  ".join(f"{k}={v}" for k, v in fields.items() if v not in (None, ""))
+        line = f"{ts} | {level:<5} | {msg}" + (f" | {extra}" if extra else "")
+        with _BIZ_LOCK:
+            if _BIZ_HANDLE is None:
+                p = _resolve_log_path()
+                p.parent.mkdir(parents=True, exist_ok=True)
+                _BIZ_HANDLE = open(p, "a", encoding="utf-8")
+            _BIZ_HANDLE.write(line + "\n")
+            _BIZ_HANDLE.flush()
+    except Exception:
+        pass
+
 
 # ---------------- 配置（可用环境变量覆盖；运行时可经 /api/config 调整并持久化） ----------------
 WEBUI_HOST = os.environ.get("MINERU_WEBUI_HOST", "127.0.0.1")
@@ -55,6 +138,15 @@ DEFAULT_BACKEND = os.environ.get("MINERU_BACKEND", "pipeline")
 
 CONFIG_PATH = DATA / "config.json"
 DEFAULT_OUTPUT_ROOT = os.environ.get("MINERU_WEBUI_OUTPUT", r"D:\MinerU-Output")
+
+
+def _init_download_threads():
+    """下载线程数默认值：优先读安装器写入 mineru.json 的 download-threads（4-64）。"""
+    try:
+        d = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
+        return min(64, max(4, int(d.get("download-threads", 16))))
+    except Exception:
+        return 16
 DEFAULT_PARAMS = {   # 解析参数默认值（可经设置界面调整并持久化，作为文档解析页的初始值）
     "lang": "ch",                  # 语言：ch/en/ja/ko/auto
     "backend": DEFAULT_BACKEND,    # 引擎：pipeline / hybrid-engine
@@ -69,6 +161,7 @@ DEFAULT_CONFIG = {
     "output_dir": DEFAULT_OUTPUT_ROOT,                     # 解析结果输出根目录（每批一个子目录）
     "idle_release_seconds": int(os.environ.get("MINERU_WEBUI_IDLE_RELEASE", "30")),
     "batch_close_seconds": int(os.environ.get("MINERU_WEBUI_BATCH_CLOSE", "60")),  # 队列清空闲置多久后关闭批次
+    "download_threads": _init_download_threads(),     # 下载线程数（4-64，默认 16，与安装器经 mineru.json 共享）
     "default_params": dict(DEFAULT_PARAMS),                # 解析参数默认值（文档解析页初始参数）
     "formats": {                                                  # 导出内容（对应官方 return_* 开关）
         "md": True,               # Markdown
@@ -126,7 +219,7 @@ class ConfigStore:
 
     def update(self, patch):
         with self._lock:
-            for k in ("output_dir", "idle_release_seconds", "batch_close_seconds"):
+            for k in ("output_dir", "idle_release_seconds", "batch_close_seconds", "download_threads"):
                 if k in patch and patch[k] is not None:
                     self._data[k] = patch[k]
             if isinstance(patch.get("formats"), dict):
@@ -138,6 +231,21 @@ class ConfigStore:
                 dp.update({k: v for k, v in patch["default_params"].items() if k in self._defaults["default_params"]})
                 self._data["default_params"] = dp
             self._save()
+        if patch.get("download_threads") is not None:
+            self._sync_mineru_json(patch["download_threads"])
+
+    def _sync_mineru_json(self, threads):
+        """下载线程数同步写回 mineru.json（读-改-写，与安装器共享 download-threads 键）。"""
+        try:
+            d = {}
+            if CONFIG_JSON.exists():
+                d = json.loads(CONFIG_JSON.read_text(encoding="utf-8")) or {}
+            if isinstance(d, dict):
+                d["download-threads"] = int(threads)
+                CONFIG_JSON.write_text(
+                    json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def _save(self):
         try:
@@ -280,12 +388,20 @@ class Engine:
                 # 内部状态互相踩踏导致张量形状错乱而崩溃（RuntimeError: expanded size）。
                 # 强制引擎串行处理请求，前端并发数只决定“同时排队提交的文件数”。
                 os.environ["MINERU_API_MAX_CONCURRENT_REQUESTS"] = "1"
+                # 禁用引擎子进程 stdout 块缓冲：tqdm 逐页进度实时落盘到运行日志，
+                # 否则 32 页等快速任务的中间进度被 8KB 缓冲吞掉，界面只见 0→32 跳变
+                os.environ["PYTHONUNBUFFERED"] = "1"
+                # 引擎子进程 loguru 输出禁用颜色，避免运行日志堆满 ANSI 转义码（\x1b[32m 等）
+                os.environ["LOGURU_COLORIZE"] = "false"
                 _ensure_modelscope_home()
                 server, started = self._manager.ensure_started()
                 self._server = server
                 # 首次拉起时等待模型加载完成，期间保持“启动中”
                 if started:
+                    t0 = time.monotonic()
                     self._wait_engine_healthy(server, server.base_url)
+                    biz_log("INFO", "引擎冷启动完成（模型加载就绪）",
+                            耗时=f"{time.monotonic()-t0:.1f}s", 地址=server.base_url)
                 self._running = True
                 return server.base_url, server
         finally:
@@ -329,10 +445,12 @@ class Engine:
             return "stopped"
         return "running" if busy else "idle"
 
-    def stop(self):
-        """停止内部解析引擎，释放 GPU 显存与内存。"""
+    def stop(self, reason="手动停止/退出"):
+        """停止内部解析引擎，释放 GPU 显存与内存。reason 写入主业务日志便于追溯。
+        仅在本进程确实拉起过引擎时才记录日志，避免重复实例/瞬态进程在 atexit 时误写。"""
         self._starting = False
         with self._lock:
+            had_server = self._server is not None
             if self._server is not None:
                 try:
                     self._manager.stop()
@@ -341,6 +459,8 @@ class Engine:
                     self._running = False
                     _force_gc()
             self._manual_stopped = True
+        if had_server:
+            biz_log("INFO", "引擎已停止并释放资源", 原因=reason)
 
     def should_release(self):
         return self._manual_stopped or self._server is None
@@ -398,32 +518,88 @@ def engine_state():
 
 # ==================================================================
 # 引擎内部阶段跟踪：引擎子进程继承本进程 stdout，经重定向落盘到
-# _data/logs/engine.log；尾随该文件解析 MinerU pipeline 阶段标记，
+# 本次运行日志（logs/MinerU_日期_时间.log）；尾随该文件解析 MinerU pipeline 阶段标记，
 # 供前端展示“当前处理到哪个阶段”（版面/OCR/公式/表格/页面等）。
 # 解析失败时优雅降级为“解析中”，不影响主流程。
 # ==================================================================
+def _tqdm_marker(stage_id, desc, label):
+    """构造 tqdm 阶段标记：优先捕获进度条的 current/total（{b}/{t} 显示为子进度，
+    如“OCR 文字识别 12/45”），进度条格式异常/被截断时退化回纯阶段名。
+    stage_id 为机器可读阶段标识，供前端映射到解析进度条节点。"""
+    esc = re.escape(desc)
+    return [
+        (stage_id, rf"{esc}.*?:\s*\d+%\|.*?\|\s*(\d+)/(\d+)\s*\[", f"{label} {{b}}/{{t}}"),
+        (stage_id, rf"{esc}", label),
+    ]
+
+
 ENGINE_STAGE_MARKERS = [
-    # (正则, 阶段文案)；{b}/{t} 会替换为批量进度
-    (r"DocAnalysis init done!", "模型加载完成"),
-    (r"model init cost", "模型初始化"),
-    (r"Pipeline processing-window multi-file run", "开始解析"),
-    (r"Pipeline processing window batch\s*(\d+)/(\d+)", "页面批量分析 {b}/{t}"),
-    (r"Table-ocr rec", "表格识别"),
-    (r"Table-ocr det", "表格检测"),
-    (r"OCR-det", "OCR 文字检测"),
-    (r"Processing pages", "页面处理中"),
-    (r"Compression successful", "结果压缩"),
+    # (stage_id, 正则, 阶段文案)；stage_id 供前端映射解析进度条节点，
+    # {b}/{t} 替换为批量进度或阶段内子进度。按日志出现顺序排列，
+    # 同一行命中多条时取列表中最先匹配的 pattern。
+    # —— 冷启动 / 模型加载 ——
+    ("model", r"DocAnalysis init, this may take", "模型初始化"),
+    ("model", r"DocAnalysis init done!", "模型加载完成"),
+    ("model", r"model init cost", "模型加载完成"),
+    # —— 解析主流程 ——
+    ("parse_start", r"Pipeline processing-window multi-file run", "开始解析"),
+    ("parse_start", r"Pipeline processing window batch\s*(\d+)/(\d+)", "页面批量分析 {b}/{t}"),
+    # —— 单批页面分析（tqdm 进度条，均含子进度）——
+    *_tqdm_marker("layout", "Layout Predict", "版面预测"),
+    *_tqdm_marker("mfr", "MFR Predict", "公式识别"),
+    *_tqdm_marker("table", "Table orientation", "表格方向检测"),
+    *_tqdm_marker("table", "Table-ocr det", "表格 OCR 检测"),
+    *_tqdm_marker("table", "Table-ocr rec", "表格 OCR 识别"),
+    *_tqdm_marker("table", "Table-wireless Predict", "无线表格识别"),
+    *_tqdm_marker("table", "Table-wired Predict", "有线表格识别"),
+    *_tqdm_marker("ocr", "OCR-det", "OCR 文字检测"),
+    *_tqdm_marker("ocr", "OCR-rec Predict", "OCR 文字识别"),
+    *_tqdm_marker("seal", "Seal Predict", "印章识别"),
+    # "Processing pages" 是页面装配循环（OCR-det 之后、OCR-rec 之前），归入 ocr 节点，
+    # 用页数作为节点内子进度，避免误入 final 导致进度条中途提前 100%
+    *_tqdm_marker("ocr", "Processing pages", "页面处理中"),
+    # —— 跨批次 / 收尾 ——
+    ("final", r"Compression successful", "结果压缩"),
 ]
+
+# 页码进度日志标记（引擎串行处理，页码归属当前 processing 任务）：
+# - run 行声明本次任务总页数，是页进度重置边界
+# - "Processing pages"（tqdm 逐页累计）为最细粒度源，批次行作兜底
+PAGE_RUN_RE = re.compile(
+    r"Pipeline processing-window multi-file run\.\s+doc_count=\d+,\s+total_pages=(\d+)"
+)
+PAGE_TQDM_RE = re.compile(r"Processing pages:\s*\d+%\|.*?\|\s*(\d+)/(\d+)\s*\[")
+PAGE_BATCH_RE = re.compile(
+    r"Pipeline processing window batch\s*\d+/\d+:\s*(\d+)/(\d+)\s*pages"
+)
 
 
 class EngineStageTracker:
+    """跟踪引擎内部阶段（阶段文案 + 逐页进度）。
+
+    页码源自引擎日志：每次 run 声明 total_pages，"Processing pages" 逐页累计。
+    引擎串行处理（MINERU_API_MAX_CONCURRENT_REQUESTS=1），页码归属当前 processing 任务；
+    attach/detach 由 process_one 在任务进入/离开解析状态时调用。
+    """
+
     def __init__(self):
         self._lock = threading.Lock()
         self._stage = ""
-        self._log_path = DATA / "logs" / "engine.log"
+        self._stage_id = ""        # 机器可读阶段标识（供前端映射解析进度条节点）
+        self._stage_cur = 0        # 当前阶段内子进度（如“版面预测 16/32”的 16）
+        self._stage_total = 0
+        self._page_total = 0
+        self._page_current = 0
+        self._has_page = False
+        self._task_id = None
+        self._last_logged_stage = ""   # 已写入业务日志的阶段基名（去子进度），防重复日志
+        self._last_logged_page = -1    # 已写入业务日志的页进度里程碑
+        self._log_path = None  # start() 时解析为引擎原始日志（logs/MinerU_日期_时间_engine.log）
+        self._vlm_extract_pending = False  # Hybrid VLM 两步抽取：Extract Preparation 后等待裸 "Predict:" 内容抽取进度
 
     def start(self):
         try:
+            self._log_path = _engine_log_path()
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
             threading.Thread(target=self._tail_loop, daemon=True).start()
         except Exception:
@@ -433,9 +609,100 @@ class EngineStageTracker:
         with self._lock:
             return self._stage or ""
 
-    def _set(self, stage):
+    def stage_info(self):
+        """当前阶段的机器可读结构 {id, label, cur, total}，供前端映射解析进度条。"""
         with self._lock:
-            self._stage = stage
+            return {
+                "id": self._stage_id or "",
+                "label": self._stage or "",
+                "cur": self._stage_cur,
+                "total": self._stage_total,
+            }
+
+    # ---- 页码归属（引擎串行，至多一个任务在 processing） ----
+    def attach(self, tid):
+        """任务进入 processing 时归属：后续页码解析到该任务名下。
+        同时清零阶段/页码状态：引擎串行处理，新任务必须从"开始解析"起步，
+        避免继承上一任务残留阶段（否则进度条开局即跳到"文字识别"）。"""
+        with self._lock:
+            self._task_id = tid
+            self._stage = ""
+            self._stage_id = ""
+            self._stage_cur = 0
+            self._stage_total = 0
+            self._has_page = False
+            self._page_current = 0
+            self._page_total = 0
+            self._last_logged_stage = ""
+            self._last_logged_page = -1
+            self._vlm_extract_pending = False
+
+    def detach(self, tid):
+        """任务离开 processing 时清理；仅当仍归属该任务时才清，防误清新任务页码。
+        同时清空阶段/页码状态：任务进入下载/整理/完成即不再归属解析阶段，
+        顶栏仅显示引擎状态，阶段残留只会造成状态矛盾。"""
+        with self._lock:
+            if self._task_id == tid:
+                self._task_id = None
+                self._stage = ""
+                self._stage_id = ""
+                self._stage_cur = 0
+                self._stage_total = 0
+                self._has_page = False
+                self._page_current = 0
+                self._page_total = 0
+                self._last_logged_stage = ""
+                self._last_logged_page = -1
+
+    def page_for(self, tid):
+        """返回 (current, total)；无归属或无页码数据时返回 None。"""
+        with self._lock:
+            if self._task_id == tid and self._has_page:
+                return self._page_current, self._page_total
+            return None
+
+    def _set(self, stage_id, label):
+        """更新当前阶段到 UI；阶段基名（去子进度）变化时写一条主业务日志。
+        stage_id 为机器可读阶段标识，label 可含子进度如“版面预测 16/32”。"""
+        with self._lock:
+            self._stage_id = stage_id
+            self._stage = label
+            m = re.search(r"(\d+)/(\d+)\s*$", label)
+            if m:
+                self._stage_cur, self._stage_total = int(m.group(1)), int(m.group(2))
+            else:
+                self._stage_cur, self._stage_total = 0, 0
+            base = re.sub(r"\s+\d+/\d+\s*$", "", label).strip() or label
+            if self._task_id and base != self._last_logged_stage:
+                self._last_logged_stage = base
+                self._log_biz("解析阶段", 阶段=base)
+
+    def _start_run(self, total):
+        with self._lock:
+            self._page_current = 0
+            self._page_total = total
+            self._has_page = True
+            self._last_logged_page = -1
+
+    def _update_page(self, current, total):
+        with self._lock:
+            self._page_current = current
+            if total:
+                self._page_total = total
+            self._has_page = True
+            # 页进度按“距上次记录再前进约 10%”写一条业务日志（含末页），避免逐页刷屏
+            if total and self._task_id and current > 0:
+                step = max(1, round(total / 10))
+                if current == total or current >= self._last_logged_page + step:
+                    self._last_logged_page = current
+                    self._log_biz("页进度", 页=f"{current}/{total}")
+
+    def _log_biz(self, event, **fields):
+        fname = None
+        t = STORE.get(self._task_id) if self._task_id else None
+        if t:
+            fname = t.get("filename")
+        biz_log("INFO", event, 文件=fname, **fields)
 
     def _tail_loop(self):
         """从文件末尾开始增量读取，解析最近出现的阶段标记。"""
@@ -465,33 +732,60 @@ class EngineStageTracker:
 
     def _parse(self, chunk):
         text = chunk.decode("utf-8", errors="replace")
-        matched = None
+        # 清理 ANSI 控制序列（tqdm 可能输出），避免干扰正则匹配
+        text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
         for line in text.splitlines():
-            for pattern, label in ENGINE_STAGE_MARKERS:
+            self._parse_page_line(line)
+            # Hybrid VLM 两步抽取：Layout Preparation → Predict(版面检测) → Layout Output Parsing
+            # → Extract Preparation → Predict(VLM 内容抽取) → Post Processing。
+            # 裸 "Predict:" 进度条本身无区分度，靠前置 "Extract Preparation" 确定其为内容抽取，
+            # 并以 x/N 子进度刷新"表格识别（VLM）"阶段，避免 10+ 分钟的 VLM 表格抽取在界面看似卡死。
+            if re.search(r"Extract Preparation", line):
+                self._vlm_extract_pending = True
+            elif re.search(r"Post Processing", line):
+                self._vlm_extract_pending = False
+            elif self._vlm_extract_pending:
+                m = re.search(r"Predict:.*?\|\s*(\d+)/(\d+)\s*\[", line)
+                if m:
+                    self._set("table", f"表格识别（VLM） {m.group(1)}/{m.group(2)}")
+                    continue
+            for stage_id, pattern, label in ENGINE_STAGE_MARKERS:
                 m = re.search(pattern, line)
                 if m:
-                    matched = (label, m)
-        if matched:
-            label, m = matched
-            if m and m.groups():
-                try:
-                    label = label.replace("{b}", m.group(1)).replace("{t}", m.group(2))
-                except Exception:
-                    pass
-            self._set(label)
+                    if m.groups():
+                        try:
+                            label = label.replace("{b}", m.group(1)).replace("{t}", m.group(2))
+                        except Exception:
+                            pass
+                    self._set(stage_id, label)
+                    break
+
+    def _parse_page_line(self, line):
+        m = PAGE_RUN_RE.search(line)
+        if m:
+            self._start_run(int(m.group(1)))
+            return
+        m = PAGE_TQDM_RE.search(line)
+        if m:
+            self._update_page(int(m.group(1)), int(m.group(2)))
+            return
+        m = PAGE_BATCH_RE.search(line)
+        if m:
+            # 批次行仅声明本批总页数（不是进度），只设置 total，避免误报“页=32/32”
+            self._start_run(int(m.group(2)))
 
 
 ENGINE_STAGE = EngineStageTracker()
 
 
 def _redirect_engine_log():
-    """将本进程 stdout/stderr（引擎子进程继承）重定向到 _data/logs/engine.log，
+    """将本进程 stdout/stderr（引擎子进程继承）重定向到引擎原始日志
+    （logs/MinerU_日期_时间_engine.log，每次运行新建），
     供 EngineStageTracker 解析引擎处理阶段。失败时静默跳过。"""
     try:
-        log_dir = DATA / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        path = log_dir / "engine.log"
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        path = _engine_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         os.dup2(fd, 1)
         os.dup2(fd, 2)
         if fd > 2:
@@ -622,6 +916,7 @@ class BatchManager:
                         f"输出根目录不可写（{primary}），已回退到 {root}，"
                         f"请检查目录权限或在设置中修改输出目录"
                     )
+                biz_log("INFO", "新建批次", 批次=folder, 名称=name or "", 目录=str(bdir))
                 return {
                     "id": folder,
                     "stamp": stamp,
@@ -725,6 +1020,7 @@ class BatchManager:
             cur = self._batches.get(self._current_id) if self._current_id else None
             if cur:
                 cur["closed"] = True
+                biz_log("INFO", "批次已关闭", 批次=cur["id"], 目录=str(cur["dir"]))
 
     def scan(self):
         """扫描输出根目录（含回退目录）下全部批次文件夹，合并本会话注册表状态，
@@ -790,6 +1086,7 @@ class BatchManager:
             if self._current_id == batch_id:
                 self._current_id = new_id
             _patch_task_dirs(batch_id, old_dir, new_dir, new_id)
+            biz_log("INFO", "批次重命名", 原批次=batch_id, 新批次=new_id, 目录=str(new_dir))
             return deepcopy(b)
 
     def reset_root(self):
@@ -907,6 +1204,8 @@ async def process_one(task):
         STORE.set_status(tid, st, extra={"elapsed": round(time.monotonic() - stime, 1), **kw})
 
     set_st(ST_PREPARE)
+    ENGINE_STAGE.attach(tid)   # 尽早归属阶段/页码（覆盖引擎冷启动与整个解析过程）
+    biz_log("INFO", "任务开始解析", 文件=task["filename"], 批次=task.get("batch_id"))
     try:
         # 确保引擎在运行且健康就绪（冷启动需加载模型，ensure_started 内等待 /health healthy）
         set_st(ST_CHECK)
@@ -982,9 +1281,19 @@ async def process_one(task):
             "preview_md": preview_md,
             "duration": round(time.monotonic() - stime, 1),
         })
+        page_total = None
+        _pg = ENGINE_STAGE.page_for(tid)
+        if _pg:
+            page_total = _pg[1]
+        biz_log("INFO", "任务解析完成", 文件=task["filename"],
+                页数=page_total, 用时=f"{time.monotonic()-stime:.1f}s", 输出=str(file_dir))
     except Exception as e:  # noqa: BLE001
         set_st(ST_ERROR, error=str(e)[:500], duration=round(time.monotonic() - stime, 1))
+        biz_log("ERROR", "任务解析失败", 文件=task["filename"],
+                错误=str(e)[:200], 用时=f"{time.monotonic()-stime:.1f}s")
     finally:
+        # 任务离开解析状态，清掉页码归属（含失败/取消路径）
+        ENGINE_STAGE.detach(tid)
         # 任务可能已被移除；仍在队列中则重算活动计数（避免并发误清零）
         if STORE.get(tid) is not None:
             STORE.recalc_active()
@@ -1072,7 +1381,7 @@ async def scheduler():
                 IDLE_SINCE = last_busy
             idle_secs = CONFIG.get().get("idle_release_seconds", 120)
             if time.time() - last_busy > idle_secs and ENGINE.is_running():
-                ENGINE.stop()  # 释放 GPU 显存
+                ENGINE.stop(reason="空闲释放")  # 释放 GPU 显存
             batch_close = CONFIG.get().get("batch_close_seconds", 60)
             if BATCH.is_open() and time.time() - last_busy > batch_close:
                 BATCH.close()  # 关闭批次，下一批重新建目录
@@ -1099,7 +1408,7 @@ def _background_loop():
     try:
         loop.run_until_complete(scheduler())
     except Exception:
-        traceback.print_exc()  # 落盘到 webui.err.log，避免静默吞掉调度器异常
+        traceback.print_exc()  # 写入本次运行日志（stderr 已重定向），避免静默吞掉调度器异常
     finally:
         # 收尾：取消所有待处理任务，优雅关闭事件循环
         pending = asyncio.all_tasks(loop)
@@ -1123,6 +1432,7 @@ def shutdown():
             _stop_engine_safely()
         except Exception:
             pass
+        biz_log("INFO", "MinerU 文档解析服务已停止")
         time.sleep(0.6)
         try:
             os._exit(0)
@@ -1177,6 +1487,11 @@ async def update_config(payload: dict):
             payload["batch_close_seconds"] = max(10, min(86400, int(payload["batch_close_seconds"])))
         except Exception:
             raise HTTPException(400, "批次关闭时间必须是整数（秒）")
+    if "download_threads" in payload and payload["download_threads"] is not None:
+        try:
+            payload["download_threads"] = max(4, min(64, int(payload["download_threads"])))
+        except Exception:
+            raise HTTPException(400, "下载线程数必须是整数（4-64）")
     # 解析参数默认值：仅白名单字段 + 值域校验
     dp = payload.get("default_params")
     if isinstance(dp, dict):
@@ -1198,6 +1513,7 @@ async def update_config(payload: dict):
             if k in dp and not isinstance(dp[k], bool):
                 dp[k] = bool(dp[k])
     CONFIG.update(payload)
+    biz_log("INFO", "配置已更新", 项=",".join(payload.keys()))
     return CONFIG.get()
 
 
@@ -1271,6 +1587,9 @@ async def create_task(
         STORE.add(task)
         await QUEUE.put(task)
         results.append({"id": tid, "filename": filename, "status": task["status"]})
+    names = "、".join(f.filename for f in files)[:200]
+    biz_log("INFO", f"提交 {len(files)} 个文件到解析队列",
+            批次=locked_batch_id, 文件=names, 语言=_norm_lang(lang), 引擎=backend)
     return {"tasks": results}
 
 
@@ -1312,10 +1631,18 @@ def list_tasks():
     tasks = STORE.all()
     # 各批次当前任务数（供前端选择器显示"N 个任务"）
     counts = {}
+    # 页码进度只归属当前解析中任务（引擎串行，至多一个）；其余任务原样返回
+    out = []
     for t in tasks:
+        if t.get("status") == ST_PROCESS:
+            pg = ENGINE_STAGE.page_for(t["id"])
+            if pg:
+                t = dict(t)
+                t["page_current"], t["page_total"] = pg
         bid = t.get("batch_id")
         if bid:
             counts[bid] = counts.get(bid, 0) + 1
+        out.append(t)
     batch_list = []
     for b in BATCH.scan():
         batch_list.append({
@@ -1326,20 +1653,24 @@ def list_tasks():
             "closed": b.get("closed", True),
             "task_count": counts.get(b["id"], 0),
         })
+    _st = ENGINE_STAGE.stage_info()
     return {
         "total": p["total"],
         "completed": p["completed"],
         "active_processing": STORE.active_processing,
         "engine_running": ENGINE.is_running(),
         "engine_state": engine_state(),
-        "engine_stage": ENGINE_STAGE.current(),
+        "engine_stage": _st["label"],
+        "engine_stage_id": _st["id"],
+        "engine_stage_cur": _st["cur"],
+        "engine_stage_total": _st["total"],
         "batch": BATCH.current(),
         "batch_id": BATCH.current_id(),
         "batch_open": BATCH.is_open(),
         "batches": batch_list,
         "idle_since": IDLE_SINCE,
         "fallback_warning": BATCH.fallback_warning(),
-        "tasks": tasks,
+        "tasks": out,
     }
 
 
@@ -1578,8 +1909,7 @@ def _port_already_served():
 
 
 def main():
-    # 先重定向引擎日志（在引擎子进程可能被拉起前），供阶段跟踪解析
-    _redirect_engine_log()
+    # 先做单实例检查（互斥体 + 端口兜底），重复实例直接退出，不触碰本次运行日志
     if not _acquire_singleton():
         print(
             "检测到 MinerU WebUI 已在运行（仅允许一个实例），本实例退出。",
@@ -1590,7 +1920,16 @@ def main():
             f"端口 {WEBUI_PORT} 已被 MinerU WebUI 占用，本实例退出。",
             file=sys.stderr, flush=True)
         return
-    uvicorn.run(app, host=WEBUI_HOST, port=WEBUI_PORT, log_level="info")
+    # 再重定向引擎日志（引擎原始日志 *_engine.log，每次运行新建并清空之前日志），
+    # 供阶段跟踪解析；引擎子进程在首个任务时才拉起，此处重定向时机安全。
+    _redirect_engine_log()
+    biz_log("INFO", "MinerU 文档解析服务启动",
+            端口=f"{WEBUI_HOST}:{WEBUI_PORT}", 后端=DEFAULT_BACKEND,
+            日志=f"{_resolve_log_path().name} + {_engine_log_path().name}")
+    # access_log=False 关闭 uvicorn 访问日志（前端健康轮询会高频刷屏），
+    # 日志不再被 HTTP 请求噪音淹没；log_level=warning 抑制启动 banner 噪音。
+    uvicorn.run(app, host=WEBUI_HOST, port=WEBUI_PORT,
+                log_level="warning", access_log=False)
 
 
 if __name__ == "__main__":

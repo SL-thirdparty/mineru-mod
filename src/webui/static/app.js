@@ -18,13 +18,28 @@
     done:"完成", error:"失败", canceled:"已取消",
   };
   const ACTIVE_STATUS = new Set(["preparing","checking","submitting","queued","processing","downloading","organizing"]);
-  // 单文件生命周期（展示层）：提交后直接排队，不展示内部"准备/检查/提交"技术阶段
-  const LIFE_STEPS = [
-    {id:"queued",      label:"排队"},
-    {id:"processing",  label:"解析"},
-    {id:"downloading", label:"下载"},
-    {id:"organizing",  label:"整理"},
+  // 解析过程节点（按引擎真实执行顺序；weight 为占"开始解析→完成"的百分比，合计 100；
+  // 权重按真实耗时分配：文字识别（含 OCR 检测/页面处理/OCR 识别）最长占最大段，
+  // 避免任何节点提前 100%。desc 为节点 hover 提示中的阶段具体描述）
+  const PARSE_STAGES = [
+    {id:"parse_start", label:"开始解析", desc:"准备解析任务并切分文档页面", weight:5},
+    {id:"model",       label:"模型加载", desc:"加载解析模型，首次约需 1–2 分钟", weight:15},
+    {id:"layout",      label:"版面预测", desc:"识别页面版面结构（标题/正文/表格/图片区域）", weight:20},
+    {id:"table",       label:"表格识别", desc:"识别公式与表格，还原行列结构", weight:20},
+    {id:"ocr",         label:"文字识别", desc:"对文字与印章区域进行 OCR 识别", weight:30},
+    {id:"final",       label:"结果整理", desc:"汇总结果并生成 Markdown/JSON 输出", weight:10},
   ];
+  // 引擎阶段标识 -> 解析节点（公式识别并入表格、印章并入文字识别）
+  const STAGE_NODE = {
+    parse_start:"parse_start", model:"model", layout:"layout",
+    mfr:"table", table:"table", ocr:"ocr", seal:"ocr", final:"final",
+  };
+  // 每任务解析进度状态：
+  // - nodeSeen：已到达的最高节点序号，节点只进不退（进度条逐点推进，不回退）
+  // - progSeen：节点段内百分比单调；节点前进时重置，避免旧实现"百分比被历史最大值
+  //   跨阶段钉死、与当前阶段文案脱节"的问题
+  const progSeen = {};
+  const nodeSeen = {};
   const IMG_EXTS = new Set(["png","jpg","jpeg","gif","webp","bmp","tiff","tif","svg"]);
   const FMT_IDS = {
     md:"fmt_md", middle_json:"fmt_middle_json", model_output:"fmt_model_output",
@@ -52,8 +67,9 @@
   }
   function fmtTime(sec){
     sec = Math.max(0, Math.round(sec||0));
-    const m = Math.floor(sec/60), s = sec%60;
-    return (m<10?"0":"")+m+":"+(s<10?"0":"")+s;
+    const p = n => (n<10?"0":"")+n;
+    const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
+    return h>0 ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`;
   }
   function fmtClock(ts){
     if(!ts) return "";
@@ -372,16 +388,12 @@
     eng.textContent = sideText[engState] || "未启动";
     eng.className = "sc-value " + engState;
 
-    // 引擎当前处理阶段（EngineStageTracker 解析引擎日志得出，如"表格识别"）
-    const es = $("#engineStage");
+    // 引擎当前处理阶段（EngineStageTracker 解析引擎日志得出，如"表格识别"）。
+    // 顶栏不显示，仅用于任务卡解析进度条节点的驱动。
     const stage = data.engine_stage || "";
-    if(stage && (engState==="running" || engState==="idle")){
-      es.textContent = "当前阶段：" + stage;
-      es.hidden = false;
-    }else{
-      es.textContent = "";
-      es.hidden = true;
-    }
+    const stageId = data.engine_stage_id || "";
+    const stageCur = data.engine_stage_cur || 0;
+    const stageTotal = data.engine_stage_total || 0;
 
     // 批次信息
     const batch = data.batch;
@@ -421,20 +433,23 @@
       fbEl.remove();
     }
 
-    // 汇总
+    // 汇总（含已取消任务，等待数应剔除已完成/失败/取消/解析中的任务）
     const jobs = data.tasks;
     const total = data.total || 0;
     const done = data.completed || 0;
     const fail = jobs.filter(t=>t.status==="error").length;
     const proc = jobs.filter(t=>["processing","downloading","organizing"].includes(t.status)).length;
-    const waiting = Math.max(0, jobs.length - done - fail - proc);
+    const canceled = jobs.filter(t=>t.status==="canceled").length;
+    const waiting = Math.max(0, jobs.length - done - fail - proc - canceled);
     $("#ovCount").textContent = `${done} / ${total} 份`;
     $("#ovBarInner").style.width = total>0 ? (done/total*100)+"%" : "0%";
     $("#chipProcN").textContent = proc;
     $("#chipWaitingN").textContent = waiting;
     $("#chipDoneN").textContent = done;
     $("#chipErrN").textContent = fail;
-    $("#queueState").textContent = jobs.length ? `共 ${jobs.length} 个任务 · 正在处理第 ${Math.min(done+proc, total)} 份` : "暂无任务";
+    // 汇总文案按实际状态分支：有解析中→正在处理第 K 份；有排队→排队中 X 份；否则→已全部完成
+    // （避免"0 个解析中却显示正在处理第 N 份"的误导）
+    $("#queueState").textContent = queueSummary(jobs.length, done, proc, waiting);
     $("#sideQueue").textContent = `${Math.min(done+proc, total)} / ${total} 份`;
     const navBadge = $("#navQueueBadge");
     navBadge.hidden = !(fail>0);
@@ -472,32 +487,45 @@
       const eff = (t.status==="preparing"||t.status==="checking"||t.status==="submitting") ? "queued" : t.status;
       const isProc = ["processing","downloading","organizing"].includes(eff);
       const state = isProc ? "proc" : eff==="done" ? "done" : eff==="error" ? "err" : eff==="queued" ? "queued" : "";
-      const stageHtml = buildStageBar(t, eff, isProc, stage);
       const card = document.createElement("div");
       card.className = "task " + state;
 
       // 状态标签
       const stTag = statusTag(t, state, isProc, actives, done, total);
 
-      // 进度区：处理中显示 第 a/N 份；排队时若引擎未就绪提示等待引擎；结束显示耗时
+      // 进度区：节点化解析进度（开始解析 → 模型加载 → 版面预测 → 表格识别 → 文字识别 → 结果整理 → 完成）。
+      // 节点只进不退（nodeSeen），段内百分比单调（progSeen，节点前进时重置）；
+      // 底部文案以"活跃点节点名"为源（nodeStageView），与活跃点、百分比三要素同源，杜绝脱节。
+      if(!isProc){ delete progSeen[t.id]; delete nodeSeen[t.id]; }  // 离开解析状态清进度（重试时从头开始）
       let prog = "";
-      if(isProc){
-        const idx = actives.indexOf(t) + 1;
-        const pos = done + idx;
-        const pct = total>0 ? Math.round(pos/total*100) : 0;
-        prog = `<div class="progline"><div class="pbar"><span style="width:${Math.max(8,pct)}%"></span></div><span class="ptxt">第 ${pos} / ${total} 份</span></div>`;
+      if(eff === "processing"){
+        const rawIdx = stageIdxOf(stageId);                 // 引擎阶段 -> 节点序号（未知为 -1）
+        const prevIdx = nodeSeen[t.id] != null ? nodeSeen[t.id] : -1;
+        const effIdx = Math.max(prevIdx, rawIdx);           // 节点只进不退
+        nodeSeen[t.id] = effIdx;
+        if(effIdx !== prevIdx) delete progSeen[t.id];       // 跨节点后段内进度重新计算
+        // 原始阶段回退到更低节点时（引擎日志顺序波动），百分比停在最高节点段末，不回退
+        const rawPct = (rawIdx < effIdx) ? nodeCumEnd(effIdx)
+                                         : parseProgress(rawIdx, stageCur, stageTotal);
+        const pct = monoProgress(t.id, rawPct);
+        const ns = nodeStageView(effIdx, rawIdx, stage, stageCur, stageTotal);
+        prog = buildNodeProg(pct, ns.curNode, ns.txt, ns.indet, ns.count);
+      }else if(eff === "downloading" || eff === "organizing"){
+        prog = buildNodeProg(100, "final",
+          (eff==="downloading" ? "解析完成，正在下载结果…" : "解析完成，正在整理输出…"), false);
       }else if(eff==="queued" && (engState==="starting"||engState==="stopped")){
         const hint = engState==="starting" ? "等待引擎启动（首次约需 1–2 分钟）…" : "正在准备启动引擎…";
         prog = `<div class="progline"><div class="pbar start"><span style="width:0%"></span></div><span class="ptxt" style="color:var(--warn)">${hint}</span></div>`;
       }else if(eff==="queued"){
         prog = `<div class="progline"><div class="pbar"><span style="width:0%"></span></div><span class="ptxt">${t.queued_ahead!=null ? "前面还有 "+t.queued_ahead+" 个" : "排队中"}</span></div>`;
       }else if(t.status==="done"){
-        prog = `<div class="progline"><div class="pbar done"><span style="width:100%"></span></div><span class="ptxt" style="color:var(--ok)">完成</span></div>`;
+        // 完成态复用阶段点进度条：全部 6 点点亮为完成绿，与解析中样式统一
+        prog = buildNodeProg(100, "final", "完成", false, null, true);
       }
 
       // 元信息
       let meta = `<span>提交 ${fmtClock(t.created_at)}</span>`;
-      if(t.result && t.result.files) meta += `<span class="dotsep">·</span><span>${t.result.files.length} 个文件</span>`;
+      if(t.result && t.result.files) meta += `<span class="dotsep">·</span><span>产出 ${t.result.files.length} 个文件</span>`;
       if(isProc) meta += `<span class="dotsep">·</span><span>已用 ${fmtTime(t.elapsed)}</span>`;
       if(t.status==="done") meta += `<span class="dotsep">·</span><span>耗时 ${fmtTime(t.elapsed)}</span>`;
 
@@ -516,7 +544,6 @@
           <div class="tname" title="${esc(t.filename)}">${esc(t.filename)}</div>
           <div class="tmeta">${meta}</div>
           ${prog}
-          ${stageHtml}
           ${outPath}
           ${errMsg}
         </div>
@@ -581,34 +608,86 @@
     // 排队（含内部准备/检查/提交瞬时阶段）统一显示"排队"
     if(["queued","preparing","checking","submitting"].includes(t.status))
       return `<span class="status-tag st-queued"><span class="d"></span>排队</span>`;
+    // 解析完成后的收尾阶段细分标签：下载结果 / 整理输出
+    if(t.status === "downloading") return `<span class="status-tag st-run"><span class="d"></span>下载结果</span>`;
+    if(t.status === "organizing")  return `<span class="status-tag st-run"><span class="d"></span>整理输出</span>`;
     if(isProc){
-      const idx = actives.indexOf(t) + 1;
-      const pos = done + idx;
-      return `<span class="status-tag st-run"><span class="d"></span>解析中 · ${pos}/${total}</span>`;
+      return `<span class="status-tag st-run"><span class="d"></span>解析中</span>`;
     }
     return `<span class="status-tag st-run"><span class="d"></span>${ST_LABEL[t.status]||t.status}</span>`;
   }
 
-  /* ---------- 单文件阶段指示条（4 步生命周期：排队→解析→下载→整理） ---------- */
-  function buildStageBar(t, eff, isProc, engineStage){
-    const cur = LIFE_STEPS.findIndex(s=>s.id===eff);
-    let items = "";
-    if(eff==="done"){
-      items = LIFE_STEPS.map(s=>`<span class="st-item done"><i></i>${s.label}</span>`).join("");
-    }else if(cur < 0){
-      return "";
-    }else{
-      items = LIFE_STEPS.map((s,i)=>{
-        let cls = "st-item";
-        if(i < cur) cls += " done";
-        else if(i === cur) cls += " cur";
-        else cls += " todo";
-        return `<span class="${cls}"><i></i>${s.label}</span>`;
-      }).join("");
-    }
-    const engLine = (isProc && engineStage)
-      ? `<div class="stage-eng">引擎阶段：<b>${esc(engineStage)}</b></div>` : "";
-    return `<div class="stagebar">${items}</div>${engLine}`;
+  /* ---------- 解析节点进度条（开始解析 → … → 完成） ---------- */
+  function stageIdxOf(stageId){
+    const nid = STAGE_NODE[stageId];
+    return nid ? PARSE_STAGES.findIndex(s=>s.id===nid) : -1;
+  }
+  function nodeStart(idx){ let a=0; for(let i=0;i<idx;i++) a += PARSE_STAGES[i].weight; return a; }
+  function nodeCumEnd(idx){ let a=0; for(let i=0;i<=idx;i++) a += PARSE_STAGES[i].weight; return Math.min(100,a); }
+  function parseProgress(idx, cur, total){
+    // 百分比 = 当前节点累计起点 + 段内权重 × 段内子进度，封顶在节点段末（杜绝提前 100%）
+    if(idx < 0 || idx >= PARSE_STAGES.length) idx = 0;
+    const base = nodeStart(idx);
+    let frac = 0;
+    if(total > 0 && cur != null && cur >= 0) frac = Math.min(1, cur/total);
+    return Math.min(100, base + PARSE_STAGES[idx].weight * frac);
+  }
+  function monoProgress(tid, raw){
+    // 节点段内百分比只增不减，避免同节点内子阶段计数波动（如 OCR 检测 58/58 → 页面处理 0/30）
+    const seen = progSeen[tid] || 0;
+    if(raw >= seen) progSeen[tid] = raw;
+    return Math.max(raw, seen);
+  }
+  /* 解析阶段展示决策：三要素同源 —— 活跃圆点由 effIdx 驱动，底部文案以"活跃点节点名"为源。
+     引擎阶段与活跃点同节点时才用引擎真实文案+段内子进度（如"版面预测 24/30"）；
+     引擎阶段回退/未知（顺序波动）时兜底为活跃点节点名，杜绝"点在文字识别、字在开始解析"。
+     无子进度阶段（模型加载等）显示流动条纹动画。纯函数，便于单测。 */
+  function nodeStageView(effIdx, rawIdx, stageLabel, stageCur, stageTotal){
+    const node = PARSE_STAGES[Math.max(0, Math.min(effIdx, PARSE_STAGES.length-1))];
+    const same = rawIdx === effIdx;
+    const txt = same ? (stageLabel || node.label) : node.label;
+    return {
+      curNode: node.id,
+      txt: txt,
+      indet: stageTotal <= 0,
+      count: same && stageTotal > 0 ? {cur: stageCur||0, total: stageTotal||0} : null,
+    };
+  }
+  function buildNodeProg(pct, curNode, txt, indet, count, ok){
+    pct = Math.max(0, Math.min(100, Math.round(pct||0)));
+    const barCls = "spbar" + (indet ? " indet" : "") + (ok ? " ok" : "");
+    // 底部总进度明确标注"总进度"，与胶囊上的段内 X/Y 区分，避免两套数字误读
+    const pctTxt = pct > 0 ? ` <span class="np-total">· 总进度 <b class="np-pct">${pct}%</b></span>` : "";
+    // 阶段圆点直接画在进度条上：每个点位于对应阶段完成的累计百分比处，
+    // 填充逐点推进（开始解析→模型加载→…→结果整理），到达即点亮该点。
+    // 当前节点即使段内进度已达段末（pct==累计位置）也保持 cur 高亮（脉冲），
+    // 直到引擎推进到下一节点，避免"节点切换瞬间活跃点消失"；ok(完成态) 全部点亮。
+    let acc = 0, dots = "", labels = "";
+    PARSE_STAGES.forEach(s=>{
+      acc += s.weight;
+      const done = ok || (pct >= acc && s.id !== curNode);
+      const cur = !done && s.id === curNode;
+      const cls = done ? "done" : (cur ? "cur" : "todo");
+      dots += `<i class="sp-dot ${cls}" style="left:${acc}%" title="${esc(s.label)} — ${esc(s.desc || '')}"></i>`;
+      // 活跃阶段节点标签显示数量（如"文字识别 12/186"），total>0 时才显示
+      let lb = esc(s.label);
+      if(cur && count && count.total > 0){
+        lb += ` <b>${count.cur}/${count.total}</b>`;
+      }
+      labels += `<span class="sp-lb ${cls}" style="left:${acc}%" data-desc="${esc(s.desc || s.label)}">${lb}</span>`;
+    });
+    return `<div class="progline np"><div class="${barCls}"><span class="sp-fill" style="width:${pct}%"></span>${dots}</div>
+      <div class="sp-labels">${labels}</div>
+      <span class="ptxt${ok ? " ok" : ""}">${esc(txt)}${pctTxt}</span></div>`;
+  }
+
+  /* 队列汇总文案：按实际状态分支，避免"0 个解析中却显示正在处理第 N 份"的误导。
+     有解析中→正在处理第 K 份；有排队→排队中 X 份；否则→已全部完成。纯函数，便于单测。 */
+  function queueSummary(n, done, proc, waiting){
+    if(n <= 0) return "暂无任务";
+    if(proc > 0) return `共 ${n} 个任务 · 正在处理第 ${Math.min(done+proc, n)} 份`;
+    if(waiting > 0) return `共 ${n} 个任务 · 排队中 ${waiting} 份`;
+    return `共 ${n} 个任务 · 已全部完成`;
   }
 
   /* ---------- 通用确认弹窗 ---------- */
@@ -756,12 +835,23 @@
   }
 
   /* ---------- 数据接口 ---------- */
+  /* 动态轮询：处理中有任务时 0.5s（页码实时可见），空闲时 2.5s（省请求）。 */
+  function hasActive(data){
+    const jobs = (data && data.tasks) || [];
+    return jobs.some(t=>ACTIVE_STATUS.has(t.status));
+  }
+  function schedulePoll(ms){
+    if(pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(refresh, ms);
+  }
   async function refresh(){
     try{
       const r = await fetch("/api/tasks");
       if(!r.ok) throw new Error("拉取失败");
-      render(await r.json());
-    }catch(e){ /* 服务可能刚启动 */ }
+      const data = await r.json();
+      render(data);
+      schedulePoll(hasActive(data) ? 500 : 2500);
+    }catch(e){ /* 服务可能刚启动 */ schedulePoll(2500); }
   }
 
   /* ---------- 目录操作 ---------- */
@@ -1074,6 +1164,7 @@
       $("#setOutputDir").value = c.output_dir || "";
       $("#setIdle").value = c.idle_release_seconds != null ? c.idle_release_seconds : 30;
       $("#setBatchClose").value = c.batch_close_seconds != null ? c.batch_close_seconds : 60;
+      $("#setDlThreads").value = c.download_threads != null ? c.download_threads : 16;
       const f = c.formats || {};
       for(const k in FMT_IDS){ const el = $("#"+FMT_IDS[k]); if(el) el.checked = f[k] !== false; }
       // 解析参数默认值：设置面板回显 + 文档解析页套用
@@ -1094,6 +1185,7 @@
       output_dir: $("#setOutputDir").value.trim(),
       idle_release_seconds: Math.max(5, Math.min(3600, parseInt($("#setIdle").value||"30",10)||30)),
       batch_close_seconds: Math.max(10, Math.min(86400, parseInt($("#setBatchClose").value||"60",10)||60)),
+      download_threads: Math.max(4, Math.min(64, parseInt($("#setDlThreads").value||"16",10)||16)),
       formats: {},
       default_params: {
         lang: $("#setParamLang").value,
@@ -1193,7 +1285,6 @@
 
   /* ---------- 启动：轮询 ---------- */
   initResizer();
-  pollTimer = setInterval(refresh, 2500);
   refresh();
   loadConfig();
 })();
