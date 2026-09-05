@@ -163,6 +163,14 @@ class Downloader:
     # ---- 对外接口 ----
 
     def add(self, key, dest, size=None, sha=None):
+        # 小文件（_whole_task）不会创建目录，若 dest 父目录不存在，
+        # open(part) 抛 FileNotFoundError 会被误判为源故障换源重试直至失败
+        d = os.path.dirname(dest)
+        if d:
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError:
+                pass
         self._files.append(_File(key, dest, size, sha))
 
     def run_with_retry(self, rounds=3):

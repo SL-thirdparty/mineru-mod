@@ -158,6 +158,46 @@ def _read_state_steps(root):
         return set()
 
 
+def _missing_specs(sp):
+    """site-packages 中缺失的直接依赖包名列表（dist-info 前缀探测，秒级、不发 python）。"""
+    have = set()
+    try:
+        names = os.listdir(sp)
+    except OSError:
+        return ["mineru", "pywin32", "pystray"]
+    for n in names:
+        low = n.lower()
+        if low.startswith("mineru-"):
+            have.add("mineru")
+        elif low.startswith("pywin32-"):
+            have.add("pywin32")
+        elif low.startswith("pystray-"):
+            have.add("pystray")
+    return [k for k in ("mineru", "pywin32", "pystray") if k not in have]
+
+
+def _venv_ready_desc(sp):
+    """已装直接依赖的版本摘要（mineru-3.4.5 等），供检测结果日志展示。"""
+    try:
+        names = os.listdir(sp)
+    except OSError:
+        return "依赖已就绪"
+    parts = []
+    for pre in ("mineru", "pywin32", "pystray", "torch"):
+        hit = None
+        for n in names:
+            low = n.lower()
+            if (pre == "torch" and low.startswith("torch-")
+                    and low.endswith(".dist-info")) or \
+               (pre != "torch" and low.startswith(pre + "-")
+                    and low.endswith(".dist-info")):
+                hit = n[:-len(".dist-info")]
+                break
+        if hit:
+            parts.append(hit)
+    return "、".join(parts) if parts else "依赖已就绪"
+
+
 def precheck(root):
     """安装开始时输出各组件预检状态：系统已有→ok（断点续传可见），缺失→wait。
 
@@ -184,21 +224,25 @@ def precheck(root):
     vpy = os.path.join(root, "runtime", "venv", "Scripts", "python.exe")
     sp = os.path.join(root, "runtime", "venv", "Lib", "site-packages")
     if os.path.isfile(vpy) and os.path.isdir(sp):
-        if "deps" in _read_state_steps(root):
-            comp("venv", "ok", "环境与依赖已就绪（跳过）")
+        missing = _missing_specs(sp)
+        if missing:
+            comp("venv", "wait", f"已存在，需补装依赖：{'、'.join(missing)}")
         else:
-            comp("venv", "wait", "已存在，需补装依赖")
+            comp("venv", "ok", "环境与依赖已就绪（检测通过）")
     else:
         comp("venv", "wait", "待创建（含约 110 个依赖包）")
 
-    # CUDA：预检只报探测结果；状态仍 wait（torch 在依赖阶段之后才决策）
+    # CUDA：venv 已装 CUDA torch → ok（修复/重装不再重复下载）；
+    # 未装时按 GPU 探测结果报 wait，区分机器能力（GPU 机将装 CUDA 版 / CPU 机不装）。
     gpu = None
     if base is not None:
         try:
             gpu = base.detect_gpu()
         except Exception:
             gpu = None
-    if gpu:
+    if _torch_cuda_installed(root):
+        comp("cuda", "ok", "CUDA torch 已就绪（无需重新下载）")
+    elif gpu:
         comp("cuda", "wait", f"检测到 {gpu.get('name') or 'NVIDIA 显卡'}（将装 CUDA 版）")
     else:
         comp("cuda", "wait", "未检测到独显（将使用 CPU 模式）")
@@ -335,7 +379,7 @@ def download_models(root, vpy=None, threads=_DL_THREADS_DEFAULT):
 
     step("model", f"开始下载（{len(pending)} 个文件 · {pend_gb:.2f} GB · "
                   f"{threads} 线程 · 源链 {' → '.join(sources)}）")
-    comp("models", "installing",
+    comp("models", "downloading",
          f"{ok_existing}/{total_files} 已就绪 · 正在下载 {len(pending)} 个")
 
     counter = _Counter()          # 完成文件计数（字节进度用 dl.counter）
@@ -387,6 +431,10 @@ def download_models(root, vpy=None, threads=_DL_THREADS_DEFAULT):
     finally:
         _hb_stop.set()
 
+    # 下载完成 → 进入校验阶段（UI 行状态由「下载中」转为「安装中/校验中」，
+    # 不再停留在下载中的最后一条心跳上）
+    step("model", "模型下载完成，正在校验 sha256 完整性 …")
+    comp("models", "installing", "下载完成，正在校验完整性 …")
     # 最终完整性校验（引擎内已逐文件 sha 校验，这里兜底复核）
     bad = [fp for fp, size, sha in MODEL_FILES
            if not _file_ok(os.path.join(kit, fp.replace("/", os.sep)), size, sha)]
@@ -402,10 +450,24 @@ def download_models(root, vpy=None, threads=_DL_THREADS_DEFAULT):
     return True
 
 
+def _torch_cuda_installed(root):
+    """venv 的 site-packages 中是否已装 CUDA 版 torch（torch-*+cu*.dist-info 探测，
+    秒级、不发 python；CPU 版为 +cpu，不满足）。"""
+    sp = os.path.join(root, "runtime", "venv", "Lib", "site-packages")
+    if not os.path.isdir(sp):
+        return False
+    try:
+        names = os.listdir(sp)
+    except OSError:
+        return False
+    return any(n.lower().startswith("torch-") and n.lower().endswith(".dist-info")
+               and "+cu" in n.lower() for n in names)
+
+
 def predownload_torch(root, threads=_DL_THREADS_DEFAULT):
     """GPU 机器在装依赖前预下载 CUDA torch/torchvision wheel（约 3GB）到
     runtime/wheel_cache/，随后 finalize_torch 直接离线安装（免联网、免镜像慢速）。
-    无 GPU / 引擎缺失 / 下载失败 → 返回 None（回退联网安装）。"""
+    无 GPU / venv 已装 CUDA torch / 引擎缺失 / 下载失败 → 返回 None（回退联网安装）。"""
     if base is None:
         return None
     try:
@@ -415,13 +477,18 @@ def predownload_torch(root, threads=_DL_THREADS_DEFAULT):
     if not gpu:
         comp("cuda", "wait", "未检测到独显（将使用 CPU 模式，跳过预下载）")
         return None
+    # 修复/重装：venv 已装 CUDA torch → 跳过预下载（避免每次修复重复下载 ~3GB）
+    if _torch_cuda_installed(root):
+        comp("cuda", "ok", "CUDA torch 已就绪（跳过预下载）")
+        step("torch", "venv 已安装 CUDA torch，跳过预下载（不再联网）")
+        return None
     try:
         import fastdl
     except ImportError:
         return None
     cu = base.pick_cuda(gpu.get("driver_cuda", ""))
-    comp("cuda", "installing",
-         f"检测到 {gpu.get('name') or 'NVIDIA 显卡'}（将装 CUDA 版）")
+    comp("cuda", "downloading",
+         f"检测到 {gpu.get('name') or 'NVIDIA 显卡'}（预下载 CUDA torch）")
     step("torch", f"检测到 {gpu.get('name')} → 预下载 CUDA {cu} torch/torchvision wheel"
                   f"（多源竞速，约 3GB）...")
     _pause_gate()
@@ -479,19 +546,63 @@ def predownload_torch(root, threads=_DL_THREADS_DEFAULT):
     return cache
 
 
-def copy_runtime_files(src, root):
+def _terminate_under_root(root):
+    """终止可执行文件位于 root 下的进程（覆盖主程序前释放文件锁）。
+    安装器 GUI 已先弹窗确认；此处兜底竞态（下载期间用户重开应用）。
+    不依赖 psutil，修复模式可能以系统 Python 运行。"""
+    try:
+        ps = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process | Where-Object { "
+             "$_.ExecutablePath -and $_.ExecutablePath.ToLower()"
+             ".StartsWith('" + root.lower() + "') } "
+             "| ForEach-Object { $_.ProcessId }"],
+            capture_output=True, text=True, timeout=30,
+            creationflags=_NO_WINDOW)
+        pids = [ln.strip() for ln in ps.stdout.splitlines()
+                if ln.strip().isdigit()]
+    except Exception:
+        return 0
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/PID", pid, "/T", "/F"],
+                           capture_output=True, timeout=30,
+                           creationflags=_NO_WINDOW)
+        except Exception:
+            pass
+    if pids:
+        time.sleep(0.5)   # 等待句柄释放
+    return len(pids)
+
+
+def copy_runtime_files(src, root, repair=False):
     """把应用主体从资源源复制到安装目录。
-    形态：onedir 启动器（WebUI 字节码内嵌其 _internal，源码不落盘）+ 卸载器。"""
-    step("copy", "复制主程序文件 ...")
-    comp("app", "installing", "正在复制主程序文件 …")
+    形态：onedir 启动器（WebUI 字节码内嵌其 _internal，源码不落盘）+ 卸载器。
+    repair=True 时允许目标目录已存在（覆盖安装/修复）。"""
+    if repair:
+        step("copy", "检测并修复主程序文件 ...")
+        comp("app", "installing", "正在检测并修复主程序文件 …")
+    else:
+        step("copy", "复制主程序文件 ...")
+        comp("app", "installing", "正在复制主程序文件 …")
     _pause_gate()
     app_src = os.path.join(src, "MinerU文档解析")
     app_dst = os.path.join(root, "MinerU文档解析")
     if not os.path.isdir(app_src):
         comp("app", "fail", "安装包缺少主程序目录")
         raise RuntimeError("安装包缺少主程序目录（MinerU文档解析）")
-    shutil.copytree(app_src, app_dst,
-                    ignore=shutil.ignore_patterns("__pycache__", "logs", "old"))
+    try:
+        shutil.copytree(app_src, app_dst,
+                        ignore=shutil.ignore_patterns("__pycache__", "logs", "old"),
+                        dirs_exist_ok=repair)
+    except PermissionError:
+        # 目标被运行中进程锁定（如应用/引擎仍在运行）：关闭后重试一次
+        step("copy", "主程序被占用，正在关闭运行中的 MinerU 后重试 …")
+        comp("app", "installing", "正在关闭占用进程并重试 …")
+        _terminate_under_root(root)
+        shutil.copytree(app_src, app_dst,
+                        ignore=shutil.ignore_patterns("__pycache__", "logs", "old"),
+                        dirs_exist_ok=repair)
     uninstaller = os.path.join(src, "卸载MinerU.exe")
     if os.path.isfile(uninstaller):
         shutil.copy2(uninstaller, os.path.join(root, "卸载MinerU.exe"))
@@ -500,7 +611,25 @@ def copy_runtime_files(src, root):
         shutil.copy2(guide, os.path.join(root, "使用说明.html"))
     n = sum(len(fns) for _, _, fns in os.walk(app_dst))
     comp("app", "ok", f"已就绪（{n} 个文件）")
-    step("copy", "主程序文件复制完成")
+    step("copy", "主程序文件" + ("修复完成" if repair else "复制完成"))
+
+
+def _release_version():
+    """安装包构建版本：优先读 release/build_info.json（带构建时间戳，与 dist manifest
+    同源，保证「新装即最新」判定一致）；缺失（源码/测试环境）回退 APP_VERSION。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (here, os.path.join(here, "..", "..", "release"),
+                 os.path.join(os.path.dirname(here), "..")):
+        p = os.path.join(base, "build_info.json")
+        if os.path.isfile(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    v = json.load(f).get("version", "")
+                if v:
+                    return v
+            except Exception:
+                pass
+    return APP_VERSION
 
 
 def write_install_manifest(root):
@@ -517,14 +646,14 @@ def write_install_manifest(root):
                     key = os.path.relpath(fp, root).replace(os.sep, "/")
                     entries[key] = _file_sha256(fp)
     manifest = {
-        "version": APP_VERSION,
+        "version": _release_version(),
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "files": entries,
     }
     try:
         with open(os.path.join(root, ".install_manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=1)
-        step("manifest", f"安装清单已生成（{len(entries)} 个文件 · 版本 {APP_VERSION}）")
+        step("manifest", f"安装清单已生成（{len(entries)} 个文件 · 版本 {_release_version()}）")
     except OSError as e:
         step("manifest", f"警告：安装清单写入失败：{e}")
 
@@ -538,19 +667,27 @@ def ensure_venv_deps(root, mirror, local_torch_dir):
     diag = base.Diagnostics(root)
     ins = base.Installer(root, mirror, diag, local_torch_dir=local_torch_dir)
     _pause_gate()
-    step("venv", "创建虚拟环境 ...")
-    comp("venv", "installing", "创建虚拟环境 …")
-    if not ins.ensure_venv():
-        step("venv", "错误：创建虚拟环境失败")
-        comp("venv", "fail", "虚拟环境创建失败")
-        return False
-    _pause_gate()
-    step("deps", "安装依赖（镜像加速，首次较慢）...")
-    comp("venv", "installing", "下载并安装依赖（约 110 个包）…")
-    if not ins.install_deps():
-        step("deps", "错误：依赖安装失败")
-        comp("venv", "fail", "依赖安装失败")
-        return False
+    # 修复/重装判据：实际安装状态（venv 存在且直接依赖齐全），而非 state 文件——
+    # 安装成功后 .install_state.json 会被删除，仅靠它会导致每次修复都重装依赖
+    deps_ok = (os.path.isfile(os.path.join(root, "runtime", "venv", "Scripts", "python.exe"))
+               and os.path.isdir(os.path.join(root, "runtime", "venv", "Lib", "site-packages"))
+               and ins.specs_ok())
+    if not deps_ok:
+        step("venv", "创建虚拟环境 ...")
+        comp("venv", "installing", "创建虚拟环境 …")
+        if not ins.ensure_venv():
+            step("venv", "错误：创建虚拟环境失败")
+            comp("venv", "fail", "虚拟环境创建失败")
+            return False
+        _pause_gate()
+        step("deps", "安装依赖（镜像加速，首次较慢）...")
+        comp("venv", "installing", "下载并安装依赖（约 110 个包）…")
+        if not ins.install_deps():
+            step("deps", "错误：依赖安装失败")
+            comp("venv", "fail", "依赖安装失败")
+            return False
+    else:
+        step("venv", "环境与依赖已就绪（检测通过，跳过安装）")
     comp("venv", "ok", "环境与依赖已就绪")
     _pause_gate()
     step("gpu", "GPU 探测与 CUDA torch 决策 ...")
@@ -658,6 +795,10 @@ def main():
                     help="下载线程数（默认 16，范围 4-64）")
     ap.add_argument("--pause-file", default=None,
                     help="暂停标志文件：存在即在各检查点暂停，删除后继续")
+    ap.add_argument("--repair", action="store_true",
+                    help="修复模式：允许覆盖安装，跳过已就绪组件")
+    ap.add_argument("--check-only", action="store_true",
+                    help="仅检测组件状态并输出结果，不执行任何安装/修复操作")
     args = ap.parse_args()
 
     root = os.path.abspath(args.root)
@@ -670,45 +811,60 @@ def main():
 
     try:
         precheck(root)
-        copy_runtime_files(src, root)
-        result["steps"].append("copy")
-        _write_state(root, result["steps"])
+        if args.check_only:
+            # 仅检测：输出组件状态后退出，不修改任何内容（供 GUI 展示结果待用户确认）
+            result["steps"] = ["check"]
+            result["ok"] = True
+            step("check", "检测完成（仅检测，未修改任何内容）")
+        else:
+            if args.repair:
+                step("repair", "检测修复模式：扫描已安装组件并修复问题")
+            copy_runtime_files(src, root, repair=args.repair)
+            result["steps"].append("copy")
+            _write_state(root, result["steps"])
 
-        # GPU 机器先多源竞速预下载 CUDA torch wheel（~3GB），依赖装完即离线装载
-        torch_cache = predownload_torch(root, threads)
-        if not args.local_torch_dir and torch_cache:
-            args.local_torch_dir = torch_cache
+            # GPU 机器先多源竞速预下载 CUDA torch wheel（~3GB），依赖装完即离线装载；
+            # venv 已装 CUDA torch 时跳过（_torch_cuda_installed），避免修复重复下载
+            torch_cache = predownload_torch(root, threads)
+            if not args.local_torch_dir and torch_cache:
+                args.local_torch_dir = torch_cache
 
-        if not ensure_venv_deps(root, args.mirror, args.local_torch_dir):
-            raise RuntimeError("环境安装失败")
-        result["steps"].append("deps")
-        _write_state(root, result["steps"])
-        _write_config_extra(root, {"download-threads": threads})
+            if not ensure_venv_deps(root, args.mirror, args.local_torch_dir):
+                raise RuntimeError("环境安装失败")
+            result["steps"].append("deps")
+            _write_state(root, result["steps"])
+            _write_config_extra(root, {"download-threads": threads})
 
-        vpy = os.path.join(root, "runtime", "venv", "Scripts", "python.exe")
-        if not args.skip_model:
-            if not download_models(root, vpy, threads=threads):
-                raise RuntimeError("模型下载失败")
-        result["steps"].append("model")
-        _write_state(root, result["steps"])
+            vpy = os.path.join(root, "runtime", "venv", "Scripts", "python.exe")
+            if not args.skip_model:
+                if not download_models(root, vpy, threads=threads):
+                    raise RuntimeError("模型下载失败")
+            result["steps"].append("model")
+            _write_state(root, result["steps"])
 
-        if not args.no_shortcut:
-            result["shortcut_ok"] = create_shortcut(root)
-        result["steps"].append("shortcut")
+            if not args.no_shortcut:
+                result["shortcut_ok"] = create_shortcut(root)
+            result["steps"].append("shortcut")
 
-        write_install_manifest(root)
-        result["ok"] = True
-        step("done", "安装完成！")
+            write_install_manifest(root)
+            result["ok"] = True
+            step("done", "修复完成！" if args.repair else "安装完成！")
     except Exception as e:  # noqa: BLE001
         result["error"] = str(e)
-        step("error", f"安装失败: {e}")
+        step("error", f"{'修复' if args.repair else '安装'}失败: {e}")
     finally:
         if args.result:
             with open(args.result, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
-        # 成功后清理 torch 预下载缓存（~3GB）；失败保留供重跑续传
-        if result.get("ok") and torch_cache:
-            shutil.rmtree(torch_cache, ignore_errors=True)
+        # 成功后清理下载缓存（torch 预下载 ~3GB + uv/pip 包缓存 ~3GB）：
+        # 修复/重装不再重新下载，靠安装状态检测（venv 中 CUDA torch / 直接依赖
+        # 已装齐即跳过），而非保留 wheel 缓存；失败保留供重跑续传/续装。
+        # 仅检测模式为只读操作，一律不清理任何内容
+        if result.get("ok") and not args.check_only:
+            if torch_cache:
+                shutil.rmtree(torch_cache, ignore_errors=True)
+            shutil.rmtree(os.path.join(root, "runtime", "pkg_cache"),
+                          ignore_errors=True)
     return 0 if result["ok"] else 1
 
 

@@ -33,6 +33,9 @@ REMOTE = "origin"
 APP_DIR = "MinerU文档解析"
 EXTRA_FILES = ["使用说明.html", "卸载MinerU.exe"]
 INSTALLER = "MinerU安装.exe"
+# GitHub 会剥离附件名中的非字母数字字符（中文会被删掉），
+# Release 附件统一用 ASCII 名，manifest 的 installer.asset 与之保持一致
+ASSET_NAME = "MinerU_Setup.exe"
 MANIFEST = "manifest.json"
 
 
@@ -67,6 +70,28 @@ def app_version():
     return m.group(1)
 
 
+def release_version():
+    """发布版本号：优先复用 release/build_info.json —— 安装器捆绑同一文件，
+    保证「新装即最新」判定一致（本地清单版本 == dist manifest 版本）。
+    仅当文件缺失或 app_version 不匹配（源码改版后未重新打包）时才重新生成。"""
+    p = os.path.join(RELEASE, "build_info.json")
+    if os.path.isfile(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                info = json.load(f)
+            ver = str(info.get("version", ""))
+            if ver and info.get("app_version") == app_version():
+                return ver
+        except Exception:
+            pass
+    stamp = f"{app_version()}.{time.strftime('%Y%m%d%H%M%S')}"
+    info = {"app_version": app_version(), "version": stamp,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=1)
+    return stamp
+
+
 def collect_files():
     """收集发布文件 {相对路径: 绝对路径}，并校验产物齐全。"""
     files = {}
@@ -91,7 +116,9 @@ def build_stage(files, installer_info):
         shutil.rmtree(STAGE)
     os.makedirs(STAGE)
     manifest = {
-        "version": app_version(),
+        # 版本号带构建时间戳（release/build_info.json）：每次发布唯一，供「检查更新」
+        # 区分同版本的热修复构建（up_to_date 以文件差异 + 版本不降级为准）
+        "version": release_version(),
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "files": {rel: _sha256(fp) for rel, fp in sorted(files.items())},
     }
@@ -139,7 +166,7 @@ def main():
     installer_info = None
     if os.path.isfile(installer_path):
         installer_info = {
-            "asset": INSTALLER,
+            "asset": ASSET_NAME,
             "sha256": _sha256(installer_path),
             "size": os.path.getsize(installer_path),
             "release_page": "https://github.com/SL-thirdparty/mineru-mod/releases/latest",

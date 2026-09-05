@@ -6,9 +6,10 @@
   - 修复与升级二合一：哈希不一致 / 缺失的文件 = 差异文件，只补差异不全量重装；
   - venv / 模型缓存不在此通道（路径敏感且体积大），损坏由安装器修复模式重建。
 
-镜像链（国内可达，逐级回退）：
-  raw.githubusercontent.com → ghproxy.cn → cdn.jsdelivr.net/gh
-  （jsdelivr 单文件上限 20MB，本应用最大文件 19.5MB，可用）
+镜像链（国内优先，逐级回退，均经字节精确性实测）：
+  ghproxy.net → raw.githubusercontent.com → gh-proxy.com → cdn.jsdelivr.net/gh
+  （jsdelivr 对大文件可能 403，仅作最后兜底；所有下载均带 sha256 校验，
+  镜像内容被改动时自动换源重试，不会落盘损坏文件）
 
 用法：
   python updater.py --check --root C:\\MinerU_App     # 检查差异，输出 JSON
@@ -18,9 +19,12 @@
 import argparse
 import json
 import os
+import re
+import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 
@@ -45,19 +49,22 @@ DIST_BRANCH = "dist"
 TRAY_EXE = "MinerU文档解析.exe"
 STAGE_DIR = ".update"                    # 差异文件下载暂存目录（安装根下）
 MANIFEST_LOCAL = ".install_manifest.json"
+WEBUI_PORT = 7860                        # WebUI 服务端口（与托盘启动器一致）
 UA = "Mozilla/5.0 (MinerU-Updater)"
 
 
 def source_bases():
-    """拉取源前缀链：三类镜像的文件 URL 均为 <base>/<urlencoded(rel)>。
+    """拉取源前缀链：四类镜像的文件 URL 均为 <base>/<urlencoded(rel)>。
+    国内优先（ghproxy.net 实测字节精确含大文件），官方源次之。
     可用环境变量 MINERU_UPDATE_BASES（分号分隔）覆盖（测试/自建镜像用）。"""
     env = os.environ.get("MINERU_UPDATE_BASES")
     if env:
         return [b.strip() for b in env.split(";") if b.strip()]
     raw = f"https://raw.githubusercontent.com/{REPO}/{DIST_BRANCH}"
     return [
+        f"https://ghproxy.net/{raw}",
         raw,
-        f"https://ghproxy.cn/{raw}",
+        f"https://gh-proxy.com/{raw}",
         f"https://cdn.jsdelivr.net/gh/{REPO}@{DIST_BRANCH}",
     ]
 
@@ -102,8 +109,31 @@ def local_version(root):
         return "未知（未找到安装清单）"
 
 
+def local_created(root):
+    try:
+        with open(os.path.join(root, MANIFEST_LOCAL), encoding="utf-8") as f:
+            return str(json.load(f).get("created", "")).strip()
+    except Exception:
+        return ""
+
+
+def _ver_tuple(v):
+    """版本字符串 'x.y.z[.build]' → 数字元组，用于大小比较。
+    支持任意段数（发布版带构建时间戳，如 1.0.0.202609051215），
+    无法解析返回 (0, 0, 0)。"""
+    parts = re.findall(r"\d+", str(v).strip())
+    if not parts:
+        return (0, 0, 0)
+    t = tuple(int(x) for x in parts)
+    return t if len(t) >= 3 else t + (0,) * (3 - len(t))
+
+
 def check(root):
-    """对比远端 manifest 与本地文件，返回差异信息 dict。"""
+    """对比远端 manifest 与本地文件，返回差异信息 dict。
+
+    up_to_date 判定：文件全部一致（同版本热修复/构建时间戳差异不算更新），
+    或本地版本已不早于远端（dist 分支陈旧时防止把新装「降级」回旧文件）。
+    """
     remote = fetch_manifest()
     added, changed = [], []
     for rel, sha in remote["files"].items():
@@ -113,14 +143,21 @@ def check(root):
         elif file_sha256(p) != sha:
             changed.append(rel)
     cur = local_version(root)
+    files_match = not added and not changed
+    local_newer = _ver_tuple(cur) > _ver_tuple(remote["version"])
     return {
         "root": root,
         "local_version": cur,
         "remote_version": remote["version"],
+        "local_created": local_created(root),
+        "remote_created": str(remote.get("created", "")).strip(),
         "added": added,
         "changed": changed,
         "total": len(remote["files"]),
-        "up_to_date": not added and not changed and cur == remote["version"],
+        "files_match": files_match,
+        "local_newer": local_newer,
+        # 文件全同 → 最新；文件不同但本地版本更新 → 不做降级更新
+        "up_to_date": files_match or local_newer,
         "manifest": remote,
     }
 
@@ -151,20 +188,87 @@ def download(root, remote, rels, threads=16, on_event=None):
     return dl.run_with_retry(3)
 
 
-def _stop_tray(tray_pid=None):
-    """终止托盘进程树（含其 WebUI 子进程），为换文件解除占用。"""
-    if tray_pid and str(tray_pid).isdigit():
-        subprocess.run(["taskkill", "/PID", str(tray_pid), "/T", "/F"],
-                       capture_output=True, creationflags=_NO_WINDOW)
-    subprocess.run(["taskkill", "/IM", TRAY_EXE, "/T", "/F"],
-                   capture_output=True, creationflags=_NO_WINDOW)
-    for _ in range(50):                      # 等待句柄释放
+def _running_tray_procs():
+    """当前运行中的主程序进程数（0 = 未运行）。"""
+    try:
         out = subprocess.run(
             ["tasklist", "/FI", f"IMAGENAME eq {TRAY_EXE}", "/NH"],
             capture_output=True, text=True, creationflags=_NO_WINDOW)
-        if TRAY_EXE not in (out.stdout or ""):
+        return sum(1 for ln in (out.stdout or "").splitlines()
+                   if TRAY_EXE in ln)
+    except Exception:
+        return 0
+
+
+def _port_open(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        try:
+            s.connect(("127.0.0.1", port))
             return True
-        import time
+        except OSError:
+            return False
+
+
+def _stop_webui(port=None):
+    """停止后台 WebUI 服务（含其解析引擎子进程，释放 GPU 显存）。
+
+    优先走 /api/shutdown 优雅停机；失败则按端口定位进程 pid 强杀其进程树。
+    更新器进程自身是 python.exe，绝不按映像名清理，避免误杀自己。"""
+    port = port or WEBUI_PORT
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/shutdown", data=b"", method="POST")
+        urllib.request.urlopen(req, timeout=3).read()
+        for _ in range(30):
+            if not _port_open(port):
+                return True
+            time.sleep(0.2)
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["netstat", "-ano"], capture_output=True, text=True,
+            creationflags=_NO_WINDOW)
+        for ln in (out.stdout or "").splitlines():
+            parts = ln.split()
+            if len(parts) >= 5 and parts[0] == "TCP" \
+                    and parts[1].endswith(f":{port}") \
+                    and parts[3] in ("LISTENING", "ESTABLISHED"):
+                pid = parts[4]
+                if pid.isdigit():
+                    subprocess.run(["taskkill", "/PID", pid, "/T", "/F"],
+                                   capture_output=True,
+                                   creationflags=_NO_WINDOW)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _stop_tray(tray_pid=None):
+    """终止托盘进程树（含其 WebUI 子进程），为换文件解除占用。
+
+    关键：托盘「检查更新」拉起的更新器是托盘进程的子进程，若对托盘带 /T
+    强杀，会把正在执行更新的本进程一并杀掉。因此：
+      - 先优雅停 WebUI（失败则按端口强杀其进程树，不碰 python 映像名）；
+      - 托盘由 PID 单独结束（不带 /T）；
+      - 兜底按映像名结束残留托盘（不带 /T）。
+    """
+    if not _running_tray_procs() and not tray_pid:
+        return True
+    _stop_webui()
+    if tray_pid and str(tray_pid).isdigit():
+        subprocess.run(["taskkill", "/PID", str(tray_pid), "/F"],
+                       capture_output=True, creationflags=_NO_WINDOW)
+    else:
+        subprocess.run(["taskkill", "/IM", TRAY_EXE, "/T", "/F"],
+                       capture_output=True, creationflags=_NO_WINDOW)
+    subprocess.run(["taskkill", "/IM", TRAY_EXE, "/F"],
+                   capture_output=True, creationflags=_NO_WINDOW)
+    for _ in range(50):                      # 等待句柄释放
+        if not _running_tray_procs():
+            return True
         time.sleep(0.2)
     return False
 
@@ -249,9 +353,14 @@ def run_gui(root, tray_pid=None):
     btns.pack(fill="x", padx=24, pady=(0, 16))
 
     def _fmt(diff):
-        lines = [f"本地版本：{diff['local_version']}    远端版本：{diff['remote_version']}",
-                 f"远端共 {diff['total']} 个文件 · 新增 {len(diff['added'])} · 更新 {len(diff['changed'])}",
-                 ""]
+        lines = [f"本地版本：{diff['local_version']}    远端版本：{diff['remote_version']}"]
+        if diff.get("local_created") or diff.get("remote_created"):
+            lines.append(
+                f"本地构建：{diff.get('local_created') or '未知'}"
+                f"    远端构建：{diff.get('remote_created') or '未知'}")
+        lines.append(f"远端共 {diff['total']} 个文件 · "
+                     f"新增 {len(diff['added'])} · 更新 {len(diff['changed'])}")
+        lines.append("")
         for rel in (diff["added"] + diff["changed"])[:12]:
             lines.append("  " + rel + ("  （缺失）" if rel in diff["added"] else ""))
         more = len(diff["added"]) + len(diff["changed"]) - 12
@@ -270,11 +379,16 @@ def run_gui(root, tray_pid=None):
             state["diff"], state["remote"] = diff, diff["manifest"]
             info_var.set(f"检查完成 —— {'已是最新版本' if diff['up_to_date'] else '发现可更新内容'}")
             if diff["up_to_date"]:
-                list_var.set("本地文件与远端完全一致，无需修复或升级。")
+                if diff["local_newer"] and (diff["added"] or diff["changed"]):
+                    list_var.set("本地版本已更新于远端（不执行降级更新）。")
+                else:
+                    list_var.set("本地文件与远端完全一致，无需修复或升级。")
                 go_btn.config(state="disabled")
             else:
                 list_var.set(_fmt(diff))
                 go_btn.config(state="normal")
+                # 发现可更新且程序正在运行 → 主动弹窗让用户选择处理方式
+                win.after(0, _ask_running)
         threading.Thread(target=worker, daemon=True).start()
 
     go_btn = tk.Button(btns, text="下载并应用更新", state="disabled",
@@ -282,12 +396,62 @@ def run_gui(root, tray_pid=None):
                        font=("Microsoft YaHei UI", 10, "bold"))
     go_btn.pack(side="right")
 
+    waiting = {"on": False, "cancel": False}
+
     def do_update():
         diff, remote = state["diff"], state["remote"]
         if not diff or not remote:
             return
+        if waiting["on"]:            # 等待模式下再次点击 → 取消等待
+            waiting["cancel"] = True
+            return
+        if _ask_running():
+            _start_download()
+
+    def _ask_running():
+        """程序运行中询问处理方式：是=立即关闭继续；否=等待退出（可取消）；取消=中止。
+        返回 True 表示可继续下载（无进程或已关闭）。"""
+        if waiting["on"]:
+            return False
+        n = _running_tray_procs()
+        if not n:
+            return True
+        r = messagebox.askyesnocancel(
+            "MinerU 正在运行",
+            f"检测到 {n} 个 MinerU 进程正在运行。\n\n"
+            "更新需要覆盖主程序文件，请先退出 MinerU。\n\n"
+            "「是」立即关闭进程并继续更新\n"
+            "「否」等待任务完成后再更新（等待期间可取消）\n"
+            "「取消」中止本次更新")
+        if r is None:
+            return False
+        if r is False:
+            waiting["on"], waiting["cancel"] = True, False
+            go_btn.config(text="取消等待", state="normal", command=do_update)
+            _wait_tick()
+            return False
+        _stop_tray(state["tray_pid"])
+        return True
+
+    def _wait_tick():
+        if waiting["cancel"]:
+            waiting["on"] = False
+            status_var.set("已取消等待，可再次点击下载并应用更新")
+            go_btn.config(text="下载并应用更新", state="normal", command=do_update)
+            return
+        n = _running_tray_procs()
+        if n == 0:
+            waiting["on"] = False
+            status_var.set("MinerU 已退出，可开始更新")
+            go_btn.config(text="下载并应用更新", state="normal", command=do_update)
+            return
+        status_var.set(f"正在等待 MinerU 退出（当前 {n} 个进程）…")
+        win.after(1000, _wait_tick)
+
+    def _start_download():
+        diff, remote = state["diff"], state["remote"]
         rels = diff["added"] + diff["changed"]
-        go_btn.config(state="disabled")
+        go_btn.config(state="disabled", text="下载并应用更新")
         status_var.set("正在下载差异文件 …")
         # 下载线程只写计数器，主线程轮询刷新（tk 控件禁止跨线程直接操作）
         st = {"done": 0, "total": len(rels), "note": "", "result": None}

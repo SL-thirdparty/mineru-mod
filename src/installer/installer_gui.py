@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter.font as tkfont
@@ -31,6 +32,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 from comp_panel import CompPanel
+
+try:
+    import psutil  # noqa: E402  # 枚举运行中进程（锁定主程序文件）
+except Exception:
+    psutil = None
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -51,6 +57,20 @@ def _src_root():
     if getattr(sys, "frozen", False):
         return getattr(sys, "_MEIPASS", _HERE)
     return os.path.dirname(os.path.dirname(_HERE))
+
+
+# 检测时判定「需要修复」的核心组件：主程序 / 运行环境 / 模型 异常才算需要修复。
+# cuda（GPU 加速，CPU 机正常报 wait）、shortcut（桌面快捷方式，可选）、uv（加速引擎，
+# 缺失回退 pip）为可选/增强项，仅展示状态，不诱导用户执行修复。
+CORE_REPAIR = {"app", "venv", "models"}
+
+
+def _needs_repair(cid, status):
+    """组件是否触发「开始修复」：仅核心组件出现 wait/fail 才算。"""
+    return cid in CORE_REPAIR and status in ("wait", "fail")
+
+
+APP_VERSION = "1.0.0"   # 与 install_flow.py 保持一致（安装/更新后清单版本）
 
 
 _PY_URLS = [
@@ -162,6 +182,8 @@ I_PLAY    = "\uE768"
 I_CLOSE   = "\uE711"
 I_DISK    = "\uEDA2"
 I_ERROR   = "\uE783"
+I_REFRESH = "\uE72C"   # 刷新（检查更新）
+I_TRASH   = "\uE74D"   # 删除（卸载）
 
 STAGES = [
     ("准备", "复制文件与创建环境", I_FOLDER),
@@ -369,7 +391,7 @@ class TickBox(tk.Canvas):
 
 
 class Pill(tk.Canvas):
-    """圆角胶囊状态徽章：浅底深字。"""
+    """圆角胶囊状态徽章：浅底深字，前置图形随 kind 变化（✓/✗/⟳/!/圆点）。"""
 
     _KIND = {
         "idle":    (TRACK, MUTED),
@@ -377,12 +399,14 @@ class Pill(tk.Canvas):
         "success": (SUCCESS_L, SUCCESS),
         "error":   (DANGER_L, DANGER),
         "busy":    (ACCENT_L, ACCENT_D),
+        "warn":    ("#fef3c7", WARN),
     }
 
     def __init__(self, master, text="", kind="idle", height=24, padx=12):
         self._h = height
         self._padx = padx
         self._kind = kind
+        self._phase = 0.0           # 旋转图形相位（accent/busy 动态旋转）
         self._font = (FONT, 9, "bold")
         super().__init__(master, height=height, bg=master.cget("bg"),
                          highlightthickness=0)
@@ -392,28 +416,76 @@ class Pill(tk.Canvas):
     def set(self, text, kind):
         self._text = text
         self._kind = kind
-        w = self._measure.measure(text) + 2 * self._padx + 14  # 圆点占位
+        w = self._measure.measure(text) + 2 * self._padx + 20  # 前置图形占位
         self.configure(width=int(w))
         self._draw()
+
+    def pulse(self):
+        """accent/busy 旋转图形动画步进（主窗口动画循环调用）。"""
+        if self._kind in ("accent", "busy"):
+            self._phase += 0.35
+            self._draw()
 
     def _draw(self):
         self.delete("all")
         bg, fg = self._KIND.get(self._kind, self._KIND["idle"])
         w, h = int(self.cget("width")), self._h
         _rr(self, 1, 1, w - 1, h - 1, (h - 2) / 2, fill=bg, outline="")
-        # 前置圆点
-        self.create_oval(self._padx - 2, h / 2 - 3, self._padx + 4, h / 2 + 3,
-                         fill=fg, outline="")
-        self.create_text(self._padx + 10, h / 2, text=self._text,
+        cx, cy = self._padx, h / 2
+        if self._kind == "success":
+            # 对勾 ✓（结果正常）
+            self.create_line(cx - 3.5, cy, cx - 1, cy + 3.5, cx + 5, cy - 3.5,
+                             fill=fg, width=2, capstyle="round",
+                             joinstyle="round")
+        elif self._kind == "error":
+            # 叉 ✗（结果失败/异常）
+            self.create_line(cx - 4, cy - 4, cx + 4, cy + 4, fill=fg, width=2,
+                             capstyle="round")
+            self.create_line(cx - 4, cy + 4, cx + 4, cy - 4, fill=fg, width=2,
+                             capstyle="round")
+        elif self._kind == "warn":
+            # 感叹号（需要用户注意）
+            self.create_line(cx, cy - 4, cx, cy + 1, fill=fg, width=2.2,
+                             capstyle="round")
+            self.create_oval(cx - 1.6, cy + 3.4, cx + 1.6, cy + 6.6,
+                             fill=fg, outline="")
+        elif self._kind in ("accent", "busy"):
+            # 旋转刷新箭头 ⟳（进行中，动态旋转；Tk 角度 0°=右、90°=上）
+            r = 5.0
+            start = self._phase + 120          # 缺口朝上（60°~120°）
+            end = start + 300
+            self.create_arc(cx - r, cy - r, cx + r, cy + r, start=start,
+                            extent=300, style="arc", outline=fg, width=2)
+            th = math.radians(end)
+            tip = (cx + r * math.cos(th), cy - r * math.sin(th))
+            vx, vy = -math.sin(th), -math.cos(th)   # 弧线前进方向（逆时针）
+            L, wd = 4.5, 3.4
+            bx, by = tip[0] - vx * L, tip[1] - vy * L
+            px, py = math.cos(th), -math.sin(th)    # 垂直方向
+            self.create_polygon(tip[0], tip[1],
+                                bx + px * wd / 2, by + py * wd / 2,
+                                bx - px * wd / 2, by - py * wd / 2,
+                                fill=fg, outline="")
+        else:
+            # idle：静态圆点
+            self.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=fg, outline="")
+        self.create_text(self._padx + 12, h / 2, text=self._text,
                          font=self._font, fill=fg, anchor="w")
 
 
 class Installer(tk.Tk):
     def __init__(self):
         _enable_dpi_awareness()
+        # 任务栏图标独立分组（避免被 Python 默认图标覆盖）
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "MinerU.Installer.1.0")
+        except Exception:
+            pass
         super().__init__()
         self.title("MinerU 文档解析 · 一键安装")
         self.configure(bg=BG)
+        self._set_window_icon()
         self.q = queue.Queue()
         self.worker = None
         self._proc = None
@@ -425,6 +497,7 @@ class Installer(tk.Tk):
         self._running = False
         self._t0 = None              # 本次安装起始时间（总耗时秒表）
         self._act_base = ""          # 当前活动文案（不含秒表后缀）
+        self._pkg_last_ts = 0.0      # 依赖下载最后进展时间戳（停滞提示用）
         self._act_t0 = None          # 当前活动秒表起点（None=不显示耗时）
         self._pkg_total = None       # 本轮 uv 依赖解析总数
         self._pkg_done = 0
@@ -432,6 +505,17 @@ class Installer(tk.Tk):
         self._spin = 0               # 加载圈相位
         self._mq_x = 0.0             # 进度条流光偏移
         self._pulse = 0.0            # 阶段图标呼吸相位
+        self._log_fh = None          # 安装日志文件句柄
+        self._log_path = None        # 日志文件路径
+        self._repair_mode = False    # 当前是否为「检测修复」流程（决定完成文案）
+        self._checking = False       # 当前是否处于「仅检测」阶段（阶段一，未开始修复）
+        self._repair_root = None     # 检测到的安装目录（阶段二确认修复时复用）
+        self._update_prompted = False  # 已内联提示过更新（避免后台重复打扰）
+        self._update_mode = False      # 当前是否处于更新流程（决定按钮文案/状态）
+        self._update_ready = False     # 已发现新版本，等待用户点击「立即更新」
+        self._waiting_update = False   # 等待 MinerU 退出（更新三选一「否」模式）
+        self._update_diff = None       # 最近一次更新检查结果（供执行阶段复用）
+        self._update_tray_pid = None   # 运行中托盘 PID（更新应用阶段精确终止）
 
         self._build_ui()
         self.after(50, lambda: _dark_titlebar(self))
@@ -439,17 +523,425 @@ class Installer(tk.Tk):
         self.bind("<Escape>", lambda e: self._on_close())
         self._fill_presets()
         self._apply_adaptive_geometry()
+        self.after(400, self._startup_state)
 
-    def _maybe_offer_existing(self):
-        """启动后检测上次安装路径：已装则弹三选（修复/升级 · 重新安装 · 卸载）。"""
-        if self._running:
+    def _set_window_icon(self):
+        """设置窗口图标（与 exe 图标一致）。"""
+        for p in (
+            os.path.join(_resource_dir(), "icon.ico"),
+            os.path.join(_resource_dir(), "src", "tray", "icon.ico"),
+            os.path.join(_HERE, "..", "tray", "icon.ico"),
+            os.path.join(_HERE, "icon.ico"),
+        ):
+            if os.path.isfile(p):
+                try:
+                    self.iconbitmap(p)
+                except Exception:
+                    pass
+                break
+
+    def _init_log_file(self):
+        """创建安装日志文件（exe 同目录，命名 MinerU安装_日期_时间.log）。"""
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = _HERE
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(base, f"MinerU安装_{ts}.log")
+        try:
+            self._log_fh = open(path, "w", encoding="utf-8")
+            self._log_path = path
+        except OSError:
+            self._log_fh = None
+            self._log_path = None
+
+    def _close_log_file(self):
+        if self._log_fh:
+            try:
+                self._log_fh.close()
+            except OSError:
+                pass
+            self._log_fh = None
+
+    def _startup_state(self):
+        """启动后检测已安装状态：已装则常驻「检测修复/检查更新/卸载」按钮，
+        并在后台对比远端版本，发现新版本时弹窗提醒（不阻断主界面）。"""
+        self._set_buttons("idle")
+        self._refit_width()   # 窗口映射后校正宽度，防维护按钮溢出压盖
+        root = _detect_installed_root()
+        if not root or self._running:
             return
-        act = _offer_existing_actions(self)
-        if act == "exit":
-            self.destroy()
+        self._show_installed(root)
+        threading.Thread(target=self._check_update_bg, args=(root,),
+                         daemon=True).start()
+
+    def _show_installed(self, root):
+        """展示已安装状态：胶囊徽章 + 日志提示。"""
+        ver = _installed_version(root)
+        self.pill.set(f"已安装 v{ver}", "success")
+        self._append_log(f"· 检测到已安装 MinerU v{ver}：{root}", "muted")
+        self._append_log("· 可点击「检测修复」检查组件完整性，"
+                         "或「检查更新」升级到最新版本", "muted")
+
+    def _start_check_update(self):
+        """检查更新（主界面内联）：对比本地与远端清单，结果显示在状态徽章与日志。
+        发现新版本时主按钮变为「立即更新」，不打开任何新窗口。"""
+        if self.worker and self.worker.is_alive():
+            return
+        root = _detect_installed_root()
+        if not root:
+            self._set_status("error", "未检测到已安装的 MinerU")
+            self._append_log("· 检查更新：未检测到已安装的 MinerU，请先完成安装", "err")
+            return
+        self._cancel.clear()
+        self._paused = False
+        self._proc = None
+        self._update_mode = True
+        self._checking = True
+        self._update_ready = False
+        self._waiting_update = False
+        self._update_diff = None
+        self._repair_root = root
+        self._reset_progress()
+        self._set_buttons("checking")
+        self._init_log_file()
+        self._flog_placeholder(clear=True)
+        self._append_log("· 检查更新：对比本地与远端文件清单（只读，不修改）")
+        self._append_log(f"· 安装目录：{root}")
+        if self._log_path:
+            self._append_log(f"· 日志文件：{self._log_path}", "muted")
+        self._spin = 0
+        self._mq_x = 0.0
+        self._pulse = 0.0
+        self._running = True
+        self._t0 = time.time()
+        self._set_activity("正在检查更新…", stopwatch=True, fg=INK)
+        self._set_status("accent", "正在检查更新…")
+        self._anim_tick()
+        self._sec_tick()
+        self.worker = threading.Thread(target=self._run_check_update,
+                                       args=(root,), daemon=True)
+        self.worker.start()
+        self.after(80, self._poll)
+
+    def _run_check_update(self, root):
+        """检查更新 worker：updater.check 只读对比，结果经队列回 UI。"""
+        try:
+            import updater
+            self.q.put(("status", "accent", "正在对比远端清单…"))
+            d = updater.check(root)
+            self.q.put(("update_done", d))
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("log", "错误：" + str(e)))
+            self.q.put(("update_finish", False, None))
+
+    def _on_update_done(self, d):
+        """检查更新完成：已最新 → 恢复；有新版本 → 主按钮变「立即更新」。"""
+        self._checking = False
+        self._stop_flow_anim()
+        self._update_diff = d
+        self._advance_progress(100)
+        if d.get("up_to_date"):
+            ver = d.get("local_version", "未知")
+            self._set_activity("已是最新版本，无需更新", fg=SUCCESS)
+            self._set_status("success", f"已是最新版本 v{ver}")
+            self._set_buttons("done")
+            self._append_log(f"✓ 已是最新版本 v{ver}"
+                             "（文件与远端一致，或本地版本不低于远端）", "ok")
+            if d.get("local_newer") and (d.get("added") or d.get("changed")):
+                self._append_log("· 本地版本高于远端，不执行降级更新", "muted")
+        else:
+            rv = d.get("remote_version", "未知")
+            lv = d.get("local_version", "未知")
+            self._update_ready = True
+            self._set_activity(f"发现新版本 v{rv}（当前 v{lv}），"
+                               f"可点击「立即更新」", fg=ACCENT_D)
+            self._set_status("accent", f"发现新版本 v{rv}")
+            self._set_buttons("check_done")
+            self._append_log(f">>> 发现新版本 v{rv}（当前 v{lv}）", "stage")
+            if d.get("local_created") or d.get("remote_created"):
+                self._append_log(f"· 本地构建：{d.get('local_created') or '未知'}",
+                                 "muted")
+                self._append_log(f"· 远端构建：{d.get('remote_created') or '未知'}",
+                                 "muted")
+            n_add = len(d.get("added", []))
+            n_chg = len(d.get("changed", []))
+            self._append_log(f"· 远端共 {d.get('total', 0)} 个文件 · "
+                             f"新增 {n_add} · 更新 {n_chg}", "muted")
+            for rel in (d.get("added", []) + d.get("changed", []))[:10]:
+                self._append_log("  " + rel
+                                 + ("（缺失）" if rel in d.get("added", []) else ""),
+                                 "muted")
+            more = n_add + n_chg - 10
+            if more > 0:
+                self._append_log(f"· …等共 {more} 个文件未列出", "muted")
+            self._append_log("· 点击「立即更新」只下载差异文件，不影响已有环境",
+                             "muted")
+        self._refit_width()
+
+    def _check_update_bg(self, root):
+        """启动后台轻量对比远端清单：存在可更新差异才在主线程内联提示（静默失败）。
+        以文件差异为准（updater.check），而非版本号对比——本地清单版本为
+        APP_VERSION、远端带构建时间戳时，纯版本对比会让新装永远显示有更新。"""
+        try:
+            import updater
+            d = updater.check(root)
+            if not d["up_to_date"]:
+                self.after(0, lambda: self._inline_update_hint(d))
+        except Exception:
+            pass
+
+    def _inline_update_hint(self, d):
+        """后台发现新版本：主界面内联提示（状态徽章 + 主按钮「立即更新」），不弹窗。"""
+        if self._update_prompted or self._running or (self.worker
+                                                     and self.worker.is_alive()):
+            return
+        self._update_prompted = True
+        self._update_mode = True
+        self._update_ready = True
+        self._update_diff = d
+        rv = d.get("remote_version", "未知")
+        lv = d.get("local_version", "未知")
+        self._set_status("accent", f"发现新版本 v{rv}（当前 v{lv}）")
+        self._set_activity(f"发现新版本 v{rv}，可点击「立即更新」升级", fg=ACCENT_D)
+        self._set_buttons("check_done")
+        self._append_log(f"· 后台检查发现新版本 v{rv}（当前 v{lv}），"
+                         f"点击「立即更新」只下载差异文件", "warn")
+        self._refit_width()
+
+    def _start_update(self):
+        """阶段二·更新：确认运行中程序处理方式后，下载差异文件并应用。"""
+        if self.worker and self.worker.is_alive():
+            return
+        d = getattr(self, "_update_diff", None)
+        if not d or d.get("up_to_date"):
+            return
+        root = d.get("root")
+        if not root or not os.path.isdir(root):
+            messagebox.showwarning("提示", "安装目录不存在，请重新检查更新。")
+            self._set_buttons("idle")
+            return
+        self._update_ready = False
+        if not self._ask_close_app_for_update(root):
+            return
+        self._cancel.clear()
+        self._paused = False
+        self._proc = None
+        self._reset_progress()
+        self._set_buttons("running")
+        if self._log_fh is None:
+            self._init_log_file()
+            if self._log_path:
+                self._append_log(f"· 日志文件：{self._log_path}", "muted")
+        self._append_log(">>> 开始更新：下载差异文件并应用", "stage")
+        self._set_activity("正在下载差异文件…", stopwatch=True, fg=INK)
+        self._set_status("accent", "正在更新…")
+        self._spin = 0
+        self._mq_x = 0.0
+        self._pulse = 0.0
+        self._running = True
+        self._t0 = time.time()
+        self._anim_tick()
+        self._sec_tick()
+        self.worker = threading.Thread(target=self._run_update,
+                                       args=(root, d), daemon=True)
+        self.worker.start()
+        self.after(80, self._poll)
+
+    def _ask_close_app_for_update(self, root):
+        """更新前处理运行中的 MinerU：立即关闭 / 等待退出（可取消）/ 取消。
+        返回 True 表示可继续下载（无进程或已关闭）。"""
+        try:
+            import updater
+            n = updater._running_tray_procs()
+        except Exception:
+            n = 0
+        self._update_tray_pid = None
+        if n == 0:
+            return True
+        r = messagebox.askyesnocancel(
+            "MinerU 正在运行",
+            f"检测到 {n} 个 MinerU 进程正在运行。\n\n"
+            "更新需要覆盖主程序文件，请先退出 MinerU。\n\n"
+            "「是」立即关闭进程并继续更新\n"
+            "「否」等待任务完成后再更新（等待期间可点击「取消等待」）\n"
+            "「取消」中止本次更新")
+        if r is None:
+            self._append_log("· 已取消更新（MinerU 仍在运行）", "muted")
+            return False
+        if r is False:
+            self._waiting_update = True
+            self._set_buttons("upd_waiting")
+            self._set_activity("等待 MinerU 退出后自动继续更新…", fg=WARN)
+            self._set_status("accent", "等待 MinerU 退出…")
+            self._append_log(f"· 正在等待 {n} 个 MinerU 进程退出"
+                             f"（可点击「取消等待」）", "muted")
+            self._wait_update_tick()
+            return False
+        self._update_tray_pid = self._find_tray_pid(root)
+        try:
+            import updater
+            updater._stop_tray(self._update_tray_pid)
+            self._append_log("· 已关闭运行中的 MinerU 进程", "warn")
+        except Exception as e:  # noqa: BLE001
+            self._append_log("· 关闭运行中进程失败：" + str(e), "warn")
+        return True
+
+    def _find_tray_pid(self, root):
+        """定位安装根下运行的托盘主程序 PID（应用阶段精确终止，避免误伤）。"""
+        if psutil is None:
+            return None
+        root_abs = os.path.normcase(os.path.abspath(root))
+        try:
+            for p in psutil.process_iter(["pid", "exe"]):
+                try:
+                    exe = p.info.get("exe")
+                except Exception:
+                    exe = None
+                if exe and os.path.normcase(
+                        os.path.abspath(exe)).startswith(root_abs):
+                    return p.info["pid"]
+        except Exception:
+            pass
+        return None
+
+    def _wait_update_tick(self):
+        """等待模式轮询：MinerU 退出后自动进入更新。"""
+        if not getattr(self, "_waiting_update", False):
+            return
+        try:
+            import updater
+            n = updater._running_tray_procs()
+        except Exception:
+            n = 0
+        if n == 0:
+            self._waiting_update = False
+            self._append_log("· MinerU 已退出，自动开始更新", "ok")
+            self._start_update()
+            return
+        self.after(1000, self._wait_update_tick)
+
+    def _cancel_wait_update(self):
+        """取消等待模式，回到「立即更新」待确认状态。"""
+        if not getattr(self, "_waiting_update", False):
+            return
+        self._waiting_update = False
+        self._update_ready = True
+        d = getattr(self, "_update_diff", None)
+        rv = d.get("remote_version", "未知") if d else "未知"
+        self._set_buttons("check_done")
+        self._set_status("accent", f"发现新版本 v{rv}")
+        self._set_activity(f"发现新版本 v{rv}，可点击「立即更新」", fg=ACCENT_D)
+        self._append_log("· 已取消等待更新，可稍后点击「立即更新」重试", "muted")
+
+    def _run_update(self, root, diff):
+        """更新 worker：下载差异 → 应用（停托盘/替换文件/改写清单）→ 重启托盘。"""
+        try:
+            import updater
+            remote = diff["manifest"]
+            rels = diff.get("added", []) + diff.get("changed", [])
+            if not rels:
+                self.q.put(("update_finish", True, diff.get("remote_version", "未知")))
+                return
+            total = len(rels)
+            done = [0]
+
+            def on_event(*a):
+                ev = a[0] if a else ""
+                if ev == "done" and len(a) >= 2 and a[1]:
+                    done[0] += 1
+                    self.q.put(("progress", 5 + 85 * done[0] // total))
+                    self.q.put(("activity",
+                                f"正在下载差异文件 {done[0]}/{total}…", True))
+                elif ev == "switch" and len(a) >= 4:
+                    self.q.put(("log", f"· 下载源切换：{a[2]} → {a[3]}", "muted"))
+                elif ev == "retry" and len(a) >= 3:
+                    self.q.put(("log", f"· 第 {a[2]} 轮重试 {a[1]} 个文件", "warn"))
+
+            n_add = len(diff.get("added", []))
+            n_chg = len(diff.get("changed", []))
+            self.q.put(("activity", f"正在下载差异文件（共 {total} 个）…", True))
+            self.q.put(("log", f"· 需下载 {total} 个差异文件"
+                               f"（新增 {n_add} · 更新 {n_chg}）", "muted"))
+            ok, fail = updater.download(root, remote, rels,
+                                        threads=updater.read_dl_threads(root),
+                                        on_event=on_event)
+            if fail:
+                raise RuntimeError(f"{len(fail)} 个文件下载失败：{fail[:3]}")
+            if not ok:
+                raise RuntimeError("下载未完成，请重试")
+            self.q.put(("activity", "正在应用更新（需短暂关闭 MinerU）…", True))
+            self.q.put(("log", "· 差异文件下载完成，正在应用更新…", "ok"))
+            self.q.put(("progress", 93))
+            if not updater.apply_update(root, remote, rels,
+                                        tray_pid=getattr(self, "_update_tray_pid",
+                                                         None)):
+                raise RuntimeError("应用更新失败：暂存文件缺失")
+            updater.clean_stage(root)
+            self.q.put(("progress", 98))
+            updater.restart_tray(root)
+            self.q.put(("update_finish", True, remote.get("version", "未知")))
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("log", "错误：" + str(e)))
+            self.q.put(("update_finish", False, None))
+
+    def _on_update_finish(self, ok, ver=None):
+        """更新执行结束：成功 → 完成态；失败 → 恢复「立即更新」可重试。"""
+        self._running = False
+        self._act_t0 = None
+        self._waiting_update = False
+        self.spin.delete("all")
+        self.title("MinerU 文档解析 · 一键安装")
+        if ok:
+            self._advance_progress(100)
+            self._update_prompted = True
+            self._set_activity(f"更新完成，已升级到 v{ver}", fg=SUCCESS)
+            self._set_status("success", f"更新完成 v{ver}")
+            self._set_buttons("done")
+            self._append_log(f"✔ 更新完成，已升级到 v{ver}", "ok")
+            self._append_log("· 已自动重启桌面托盘程序", "muted")
+            if self._log_path:
+                self._append_log(f"· 日志已保存：{self._log_path}", "muted")
+            self._close_log_file()
+            messagebox.showinfo(
+                "更新完成", f"MinerU 已更新到 v{ver}，托盘程序已自动重启。")
+        else:
+            if getattr(self, "_checking", False):
+                # 检查阶段失败：无差异清单可执行，恢复常规状态而非「立即更新」
+                self._checking = False
+                self._update_mode = False
+                self._set_activity("检查更新失败，请稍后重试", fg=DANGER)
+                self._set_status("error", "检查更新失败")
+                self._set_buttons("idle")
+                self._append_log("■ 检查更新失败，详见上方日志", "err")
+            else:
+                self._update_ready = True
+                self._set_activity("更新失败，可点击「立即更新」重试", fg=DANGER)
+                self._set_status("error", "更新失败")
+                self._set_buttons("check_done")
+                self._append_log("■ 更新失败，详见上方日志", "err")
+        self._refit_width()
+
+    def _start_uninstall(self):
+        """卸载：确认后拉起独立卸载程序。"""
+        root = _detect_installed_root()
+        if not root:
+            messagebox.showinfo("卸载", "尚未检测到已安装的 MinerU。")
+            return
+        un = os.path.join(root, "卸载MinerU.exe")
+        if not os.path.isfile(un):
+            messagebox.showerror("无法卸载", f"未找到卸载程序：\n{un}")
+            return
+        if messagebox.askyesno(
+                "卸载 MinerU",
+                f"确定要卸载 MinerU 吗？\n\n安装位置：{root}\n\n"
+                "卸载将停止服务并清理全部文件，此操作不可撤销。"):
+            subprocess.Popen([un], creationflags=_NO_WINDOW)
 
     def _apply_adaptive_geometry(self):
-        """按实际内容需求计算初始窗口与最小尺寸（适配 DPI 缩放，避免控件溢出）。"""
+        """按实际内容需求计算初始窗口与最小尺寸（适配 DPI 缩放，避免控件溢出）。
+        先按「已安装」状态布置维护按钮，确保初始宽度容纳全部按钮（防压盖）。"""
+        self._set_buttons("idle")
         self.update_idletasks()
         req_w = self.winfo_reqwidth()
         req_h = self.winfo_reqheight()
@@ -460,6 +952,28 @@ class Installer(tk.Tk):
         init_h = min(init_h, int(sh * 0.92))
         self.geometry(f"{init_w}x{init_h}")
         self.minsize(max(req_w + 20, 640), req_h)
+
+    def _refit_width(self):
+        """按钮布局变化后重算窗口宽度，避免新增按钮溢出压盖（如完成/修复后）。"""
+        try:
+            self.update_idletasks()
+            req = self.winfo_reqwidth()
+            cur = self.winfo_width()
+            if req > cur:
+                sw = self.winfo_screenwidth()
+                new_w = min(req + 24, int(sw * 0.96))
+                if new_w > cur:
+                    x = max(self.winfo_rootx() - (new_w - cur) // 2, 0)
+                    self.geometry(f"{new_w}x{self.winfo_height()}"
+                                  f"+{x}+{self.winfo_rooty()}")
+                    self.update_idletasks()
+            try:
+                self.minsize(max(self.winfo_reqwidth() + 20, 640),
+                             self.minsize()[1])
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     # ================= UI =================
     def _build_ui(self):
@@ -587,23 +1101,33 @@ class Installer(tk.Tk):
         foot.grid_columnconfigure(0, weight=1)
         lefts = tk.Frame(foot, bg=BG)
         lefts.grid(row=0, column=0, sticky="w")
+        self.btn_repair = GradButton(lefts, "检测修复", self._start_repair,
+                                     kind="secondary", height=40, fontsize=9,
+                                     icon=I_SETTING)
+        self.btn_update = GradButton(lefts, "检查更新", self._start_check_update,
+                                     kind="secondary", height=40, fontsize=9,
+                                     icon=I_REFRESH)
+        self.btn_uninstall = GradButton(lefts, "卸载", self._start_uninstall,
+                                        kind="ghost", height=40, fontsize=9,
+                                        icon=I_TRASH)
         self.btn_pause = GradButton(lefts, "暂停", self._toggle_pause, kind="secondary",
                                     height=40, fontsize=9)
-        self.btn_pause.grid(row=0, column=0)
         self.btn_stop = GradButton(lefts, "停止", self._stop_run, kind="ghost",
                                    height=40, fontsize=9)
-        self.btn_stop.grid(row=0, column=1, padx=(10, 0))
         acts = tk.Frame(foot, bg=BG)
         acts.grid(row=0, column=1, sticky="e")
+        self.btn_confirm_fix = GradButton(acts, "开始修复", self._confirm_repair,
+                                          kind="primary", height=40, icon=I_SETTING)
+        self.btn_confirm_fix.grid(row=0, column=0, padx=(0, 10))
+        self.btn_confirm_fix.grid_remove()
         self.btn_open = GradButton(acts, "打开目录", self._open_dir, kind="secondary",
                                    height=40, icon=I_FOLDER)
-        self.btn_open.grid(row=0, column=0, padx=(0, 10))
+        self.btn_open.grid(row=0, column=1, padx=(0, 10))
+        self.btn_open.grid_remove()
         self.btn_primary = GradButton(acts, "开始安装", self.start, kind="primary",
                                       height=40, icon=I_PLAY)
-        self.btn_primary.grid(row=0, column=1)
-        self.btn_pause.grid_remove()
-        self.btn_stop.grid_remove()
-        self.btn_open.grid_remove()
+        self.btn_primary.grid(row=0, column=2)
+        self._reflow_left()
 
     def _draw_hero(self):
         """渐变头部：深青→深蓝斜向渐变 + logo + 标题 + 版本胶囊。"""
@@ -627,9 +1151,10 @@ class Installer(tk.Tk):
                        font=(FONT, 10), fill="#a7d3de")
         # 右上版本胶囊（窄窗口下隐藏，避免与标题/副标题重叠）
         if w >= 600:
-            tw = tkfont.Font(font=(FONT, 9, "bold")).measure("v1.0")
+            ver = "v" + APP_VERSION
+            tw = tkfont.Font(font=(FONT, 9, "bold")).measure(ver)
             _rr(cv, w - tw - 52, 24, w - tw - 12, 46, 11, fill="#12586b", outline="")
-            cv.create_text(w - 32 - tw / 2, 35, text="v1.0", font=(FONT, 9, "bold"),
+            cv.create_text(w - 32 - tw / 2, 35, text=ver, font=(FONT, 9, "bold"),
                            fill="#8fd0dd")
 
     def _shadow_card(self, parent, row=None, **gkw):
@@ -751,6 +1276,27 @@ class Installer(tk.Tk):
             self.flog.insert("end", s + "\n")
         self.flog.see("end")
         self.flog.config(state="disabled")
+        # 同步写入日志文件（带时间戳）
+        if self._log_fh:
+            try:
+                ts = time.strftime("%H:%M:%S")
+                self._log_fh.write(f"[{ts}] {s}\n")
+                self._log_fh.flush()
+            except OSError:
+                pass
+
+    def _reset_progress(self):
+        """新流程开始前进度归零（安装/检测/更新，避免上一轮 100% 残留）。"""
+        self._progress = 0
+        self._draw_progress()
+        self.pct.config(text="0%")
+
+    def _stop_flow_anim(self):
+        """流程（检测/检查更新）结束：停止加载圈、秒表与标题进度刷新。"""
+        self._running = False
+        self._act_t0 = None
+        self.spin.delete("all")
+        self.title("MinerU 文档解析 · 一键安装")
 
     def _advance_progress(self, value, force=False):
         """进度只前进不回退（阶段间重复事件不会把进度拉回去）。"""
@@ -778,6 +1324,7 @@ class Installer(tk.Tk):
             self._pulse += 0.13
             self._draw_pulse()
             self.comps.pulse()
+            self.pill.pulse()
         self.after(70, self._anim_tick)
 
     def _sec_tick(self):
@@ -787,8 +1334,13 @@ class Installer(tk.Tk):
             self.elapsed_lbl.config(text="已用时 " + _fmt_dur(time.time() - self._t0))
             self.title("MinerU 文档解析 · 一键安装 · %d%%" % int(self._progress))
         if self._act_t0 is not None:
-            self.act_lbl.config(text="%s · 已 %s" % (
-                self._act_base, _fmt_dur(time.time() - self._act_t0)))
+            txt = "%s · 已 %s" % (
+                self._act_base, _fmt_dur(time.time() - self._act_t0))
+            if (self._pkg_last_ts and self.worker and self.worker.is_alive()
+                    and time.time() - self._pkg_last_ts > 90):
+                # 依赖下载 90s 无任何进展（后端 180s 自动终止换源重试），提前提示
+                txt += "（下载疑似停滞，系统将自动切换源重试，请稍候…）"
+            self.act_lbl.config(text=txt)
         self.after(1000, self._sec_tick)
 
     def _draw_spin(self):
@@ -813,19 +1365,32 @@ class Installer(tk.Tk):
 
     # ---- 后端结构化事件 → 界面反馈 ----
     def _handle_comp(self, rest):
-        """[comp] 组件状态事件：id|status|detail（wait/installing/ok/fail）。"""
+        """[comp] 组件状态事件：id|status|detail（wait/checking/downloading/installing/ok/fail）。"""
         parts = rest.split("|")
         if len(parts) != 3:
             return
         cid, status, detail = parts
-        if not cid or status not in ("wait", "installing", "ok", "fail"):
+        if not cid or status not in ("wait", "checking", "downloading",
+                                     "installing", "ok", "fail"):
             return
         self.comps.set_comp(cid, status, detail)
+        # 组件状态变化全部写入日志（检测/安装过程可完整回溯：缺什么、装了什么）
         if status == "fail":
             self._append_log("✗ 组件[" + cid + "] " + detail, "err")
+        elif status == "wait":
+            self._append_log("· 组件[" + cid + "] 待安装：" + detail, "muted")
+        elif status == "ok":
+            self._append_log("✓ 组件[" + cid + "] " + detail, "ok")
+        elif status == "checking":
+            self._append_log("… 组件[" + cid + "] 检测中", "muted")
+        elif status == "downloading":
+            self._append_log("… 组件[" + cid + "] 下载中：" + detail, "muted")
+        elif status == "installing":
+            self._append_log("… 组件[" + cid + "] " + detail, "muted")
 
     def _handle_pkg(self, rest):
-        """[pkg] 事件：resolved|N|t / down|包|大小 / prepared|N|t / installed|N|t"""
+        """[pkg] 事件：resolved|N|t / down|包|大小 / prepared|N|t / installing|包 / installed|N|t
+        venv 行状态随阶段流转：解析→下载中→安装中→已就绪（由 [comp] venv|ok 收尾）。"""
         parts = rest.split("|")
         act = parts[0] if parts else ""
         try:
@@ -833,22 +1398,50 @@ class Installer(tk.Tk):
                 self._pkg_total = int(parts[1])
                 self._pkg_done = 0
                 self._pkg_names.clear()
+                self.comps.set_comp("venv", "downloading",
+                                    f"已解析 {self._pkg_total} 个依赖包，开始下载 …")
                 self._set_activity("依赖解析完成（共 %d 个包），开始下载 …" % self._pkg_total)
             elif act == "down" and len(parts) >= 2:
                 name = parts[1]
                 size = parts[2] if len(parts) > 2 else ""
-                if name and name not in self._pkg_names:
+                # 同一包可能重复出现（pip 分片/重试），明细只记首次，避免重复行与误标
+                is_new = bool(name) and name not in self._pkg_names
+                if is_new:
                     self._pkg_names.add(name)
                     self._pkg_done += 1
-                self.comps.set_pkg_feed(name, size,
-                                        self._pkg_done, self._pkg_total or 0)
+                    self.comps.set_pkg_feed(name, size,
+                                            self._pkg_done, self._pkg_total or 0)
+                # pip 回退路径无 resolved 事件（_pkg_total 为 0），此时不显示「第 N/0 个包」
+                if self._pkg_total:
+                    d = f"正在下载 {name} · 第 {self._pkg_done}/{self._pkg_total} 个包"
+                    if size:
+                        d = (f"正在下载 {name}（{size}）"
+                             f"· 第 {self._pkg_done}/{self._pkg_total} 个包")
+                else:
+                    d = f"正在下载 {name}" + (f"（{size}）" if size else "")
+                self.comps.set_comp("venv", "downloading", d)
                 label = "正在下载 %s%s" % (name, f"（{size}）" if size else "")
                 if self._pkg_total:
                     label += " · 第 %d/%d 个包" % (self._pkg_done, self._pkg_total)
                     self._advance_progress(10 + 40 * self._pkg_done / self._pkg_total)
                 self._set_activity(label, stopwatch=True, fg=INK)
+                self._pkg_last_ts = time.time()   # 有进展：刷新停滞时间戳
             elif act == "prepared" and len(parts) >= 2:
+                # 下载阶段结束，进入安装：明细行统一收尾为「✓ 已下载」
+                self._pkg_last_ts = 0.0   # 退出下载停滞监控（安装阶段无逐行输出）
+                self.comps.mark_pkg_all_downloaded()
+                self.comps.set_comp("venv", "installing",
+                                    "依赖下载完成，正在安装到虚拟环境 …")
                 self._set_activity("依赖下载完成，正在安装到虚拟环境 …")
+            elif act == "installing":
+                # pip 下载完成后进入安装阶段（Installing collected packages: ...）
+                # （pip 无 prepared 事件，此处同样收尾明细行）
+                self._pkg_last_ts = 0.0
+                self.comps.mark_pkg_all_downloaded()
+                self._set_activity("正在安装依赖到虚拟环境 …", stopwatch=True)
+                if self._pkg_total:
+                    self.comps.set_comp("venv", "installing",
+                                        f"正在安装依赖包（共 {self._pkg_total} 个）…")
             elif act == "installed" and len(parts) >= 2:
                 n, t = parts[1], (parts[2] if len(parts) > 2 else "")
                 txt = f"已安装 {n} 个包" + (f"（{t}）" if t else "")
@@ -856,6 +1449,10 @@ class Installer(tk.Tk):
                 self._set_activity("依赖就绪：" + txt)
         except (ValueError, IndexError):
             pass
+
+    def _comps_checking(self):
+        """进入检测/安装/修复：全部组件先置「检测中」，由后续事件逐个更新真实状态。"""
+        self.comps.set_all("checking", "检测中…")
 
     def _handle_mbeat(self, rest):
         """[mbeat] 模型下载心跳（后端字段：d/t|比率|已下载GB|总GB|速度MB/s|文件名）"""
@@ -956,15 +1553,30 @@ class Installer(tk.Tk):
             icon, text, fg = I_ERROR, "请选择或输入一个安装位置", DANGER
         else:
             try:
-                Path(p).mkdir(parents=True, exist_ok=True)
-                free = shutil.disk_usage(p).free
-                gig = free / (1024 ** 3)
-                if not os.access(p, os.W_OK):
-                    icon, text, fg = I_ERROR, "该目录不可写，请更换位置", DANGER
-                elif gig < 5:
-                    text, fg = f"剩余空间 {gig:.1f}GB，建议 ≥ 5GB", WARN
+                if os.path.isfile(p):
+                    icon, text, fg = I_ERROR, "该路径是一个文件，请更换位置", DANGER
                 else:
-                    text, fg = f"磁盘可用 {gig:.1f}GB · 可写入", SUCCESS
+                    # 仅检查、不创建目录：向上回溯到最近存在的父目录做可写性/空间探测。
+                    # 此前这里直接 Path(p).mkdir(...)，用户每输入一个字符就新建一个目录。
+                    base = p
+                    while base and not os.path.isdir(base):
+                        parent = os.path.dirname(base)
+                        if parent == base:
+                            break
+                        base = parent
+                    if not base or not os.path.isdir(base):
+                        icon, text, fg = I_ERROR, "无法读取该位置，请检查路径", DANGER
+                    elif not os.access(base, os.W_OK):
+                        icon, text, fg = I_ERROR, "该目录不可写，请更换位置", DANGER
+                    else:
+                        gig = shutil.disk_usage(base).free / (1024 ** 3)
+                        if gig < 5:
+                            text, fg = f"剩余空间 {gig:.1f}GB，建议 ≥ 5GB", WARN
+                        elif os.path.isdir(p):
+                            text, fg = f"磁盘可用 {gig:.1f}GB · 可写入", SUCCESS
+                        else:
+                            text, fg = (f"目录不存在，安装时自动创建 · "
+                                        f"磁盘可用 {gig:.1f}GB", SUCCESS)
             except Exception:
                 icon, text, fg = I_ERROR, "无法读取该位置，请检查路径", DANGER
         self.path_hint_icon.config(text=icon, fg=fg)
@@ -1001,31 +1613,114 @@ class Installer(tk.Tk):
         self._set_status("accent", _TAG_HINT.get(tag, STAGES[idx][1]))
         self._set_activity(_TAG_HINT.get(tag, STAGES[idx][1]), stopwatch=True, fg=INK)
 
+    def _reflow_left(self, *btns):
+        """按需重排底部左侧按钮（连续列，避免隐藏后留空列）。"""
+        for b in (self.btn_repair, self.btn_update, self.btn_uninstall,
+                  self.btn_pause, self.btn_stop):
+            b.grid_forget()
+        for i, b in enumerate(btns):
+            b.grid(row=0, column=i, padx=(0, 0) if i == 0 else (10, 0))
+
     def _set_buttons(self, state):
+        # 离开「更新运行中」后恢复维护按钮可用（更新中置灰，其余状态常态可用）
+        for b in (self.btn_repair, self.btn_update, self.btn_uninstall):
+            b.set_enabled(True)
         if state == "idle":
+            installed = bool(_detect_installed_root())
+            self._update_mode = False
+            self._update_ready = False
+            self._waiting_update = False
+            self.btn_primary.grid()
             self.btn_primary.set_enabled(True)
-            self.btn_primary.set_text("开始安装")
-            self.btn_pause.grid_remove()
-            self.btn_stop.grid_remove()
-            self.btn_open.grid_remove()
-        elif state == "running":
+            self.btn_primary.set_text("重新安装" if installed else "开始安装")
+            self.btn_confirm_fix.grid_remove()
+            if installed:
+                self.btn_open.grid()
+                self._reflow_left(self.btn_repair, self.btn_update,
+                                  self.btn_uninstall)
+            else:
+                self.btn_open.grid_remove()
+                self._reflow_left()
+        elif state == "checking":
+            # 检测/检查更新阶段：只保留「停止」可点（检测很快，无需暂停）；
+            # 更新检查为只读网络对比，无取消接口，展示维护按钮但不显示「停止」
+            self.btn_primary.grid()
             self.btn_primary.set_enabled(False)
-            self.btn_primary.set_text("安装中…")
-            self.btn_pause.set_text("暂停")
-            self.btn_pause.set_enabled(True)
-            self.btn_pause.grid()
-            self.btn_stop.grid()
+            self.btn_primary.set_text("检查更新中…" if self._update_mode else "检测中…")
+            self.btn_confirm_fix.grid_remove()
             self.btn_open.grid_remove()
+            if self._update_mode:
+                self._reflow_left(self.btn_repair, self.btn_update,
+                                  self.btn_uninstall)
+            else:
+                self._reflow_left(self.btn_stop)
+        elif state == "check_done":
+            if self._update_mode:
+                # 更新检查完成（发现新版本）：主按钮变「立即更新」，无修复确认按钮
+                self.btn_primary.grid()
+                self.btn_primary.set_enabled(True)
+                self.btn_primary.set_text("立即更新")
+                self.btn_confirm_fix.grid_remove()
+                self.btn_open.grid()
+                self._reflow_left(self.btn_repair, self.btn_update,
+                                  self.btn_uninstall)
+            else:
+                # 检测完成：展示「开始修复」等待用户确认，是否修复由用户点击决定
+                self.btn_confirm_fix.grid()
+                self.btn_open.grid()
+                self.btn_primary.grid_remove()
+                self._reflow_left(self.btn_repair, self.btn_update,
+                                  self.btn_uninstall)
+        elif state == "upd_waiting":
+            # 更新等待退出：主按钮变「取消等待」，可随时中止
+            self.btn_primary.grid()
+            self.btn_primary.set_enabled(True)
+            self.btn_primary.set_text("取消等待")
+            self.btn_confirm_fix.grid_remove()
+            self.btn_open.grid_remove()
+            self._reflow_left(self.btn_repair, self.btn_update,
+                              self.btn_uninstall)
+        elif state == "running":
+            self.btn_primary.grid()
+            self.btn_primary.set_enabled(False)
+            self.btn_primary.set_text(
+                "更新中…" if self._update_mode else
+                ("修复中…" if self._repair_mode else "安装中…"))
+            self.btn_confirm_fix.grid_remove()
+            self.btn_open.grid_remove()
+            if self._update_mode:
+                # 更新为「下载差异 + 应用」，无暂停/停止接口：维护按钮置灰展示
+                self._reflow_left(self.btn_repair, self.btn_update,
+                                  self.btn_uninstall)
+                for b in (self.btn_repair, self.btn_update, self.btn_uninstall):
+                    b.set_enabled(False)
+            else:
+                self.btn_pause.set_text("暂停")
+                self.btn_pause.set_enabled(True)
+                self._reflow_left(self.btn_pause, self.btn_stop)
         elif state == "paused":
             self.btn_pause.set_text("继续")
         elif state == "done":
+            self._update_mode = False
+            self._update_ready = False
+            self._waiting_update = False
+            self.btn_primary.grid()
             self.btn_primary.set_enabled(True)
             self.btn_primary.set_text("重新安装")
-            self.btn_pause.grid_remove()
-            self.btn_stop.grid_remove()
+            self.btn_confirm_fix.grid_remove()
+            self.btn_open.grid()
+            self._reflow_left(self.btn_repair, self.btn_update,
+                              self.btn_uninstall)
 
     # ================= 生命周期 =================
     def start(self):
+        # 更新流程调度：等待中 → 取消等待；已发现新版本 → 立即更新
+        if getattr(self, "_waiting_update", False):
+            self._cancel_wait_update()
+            return
+        if getattr(self, "_update_ready", False):
+            self._start_update()
+            return
         if self.worker and self.worker.is_alive():
             return
         root = self.path_var.get().strip()
@@ -1042,10 +1737,16 @@ class Installer(tk.Tk):
         if not os.access(root, os.W_OK):
             messagebox.showerror("目录无效", f"安装目录不可写，请更换位置：\n{root}")
             return
+        if not self._close_running_app(root):
+            return
         self._cancel.clear()
         self._paused = False
         self._proc = None
         self._pysetup = None
+        self._repair_mode = False
+        self._checking = False
+        self._update_mode = False
+        self._repair_root = None
         self._safe_unlink(os.path.join(root, ".install_pause"))
         self._stage_now = -1
         self._dl_threads_val = self._dl_threads()   # 主线程读取，worker 线程安全使用
@@ -1055,10 +1756,15 @@ class Installer(tk.Tk):
         for j in range(len(self._links)):
             self._draw_link(j)
         self.step_lbl.config(text="")
+        self._reset_progress()
         self._set_buttons("running")
+        self._init_log_file()
         self._flog_placeholder(clear=True)
         self._append_log("· 选择目录：" + root)
+        if self._log_path:
+            self._append_log(f"· 日志文件：{self._log_path}", "muted")
         self.comps.reset()
+        self._comps_checking()
         # 动画与计时：加载圈 / 进度流光 / 阶段脉动 / 秒表
         self._pkg_total = None
         self._pkg_done = 0
@@ -1074,6 +1780,281 @@ class Installer(tk.Tk):
         self.worker = threading.Thread(target=self._run, args=(root,), daemon=True)
         self.worker.start()
         self.after(80, self._poll)
+
+    # ---- 检测修复（两阶段：先检测展示结果 → 用户确认 → 执行修复）----
+    def _start_repair(self):
+        """阶段一·检测：仅扫描已安装组件并展示状态，不修改任何内容。
+        用户核对结果后点击「开始修复」才进入阶段二（_confirm_repair）。"""
+        if self.worker and self.worker.is_alive():
+            return
+        root = _detect_installed_root() or self.path_var.get().strip()
+        # 必须是真实安装目录（安装清单或 venv 存在），防止对空目录/新路径误检并诱导修复
+        real_install = (root and os.path.isdir(root) and (
+            os.path.isfile(os.path.join(root, ".install_manifest.json"))
+            or os.path.isfile(os.path.join(root, "runtime", "venv",
+                                           "Scripts", "python.exe"))))
+        if not real_install:
+            messagebox.showwarning("提示", "未检测到已安装的 MinerU，请先完成安装。")
+            return
+        # 检测为只读操作，无需关闭运行中的应用；关闭动作推迟到确认修复时
+        self._cancel.clear()
+        self._paused = False
+        self._proc = None
+        self._pysetup = None
+        self._repair_mode = True
+        self._checking = True
+        self._update_mode = False
+        self._repair_root = root
+        self._safe_unlink(os.path.join(root, ".install_pause"))
+        self._stage_now = -1
+        self._dl_threads_val = self._dl_threads()
+        self._save_prefs()
+        for i in range(len(STAGES)):
+            self._draw_step(i, "pending")
+        for j in range(len(self._links)):
+            self._draw_link(j)
+        self.step_lbl.config(text="")
+        self._reset_progress()
+        self._set_buttons("checking")
+        self._init_log_file()
+        self._flog_placeholder(clear=True)
+        self._append_log("· 检测修复：先扫描已安装组件（仅检测，不修改）")
+        self._append_log(f"· 安装目录：{root}")
+        if self._log_path:
+            self._append_log(f"· 日志文件：{self._log_path}", "muted")
+        self.comps.reset()
+        self._comps_checking()
+        self._pkg_total = None
+        self._pkg_done = 0
+        self._pkg_names.clear()
+        self._spin = 0
+        self._mq_x = 0.0
+        self._pulse = 0.0
+        self._running = True
+        self._t0 = time.time()
+        self._set_activity("正在检测组件状态…", stopwatch=True, fg=INK)
+        self._anim_tick()
+        self._sec_tick()
+        self.worker = threading.Thread(target=self._run_check, args=(root,), daemon=True)
+        self.worker.start()
+        self.after(80, self._poll)
+
+    def _run_check(self, root):
+        """检测阶段 worker：运行 install_flow.py --check-only，只输出组件状态不修改。
+        结束时统计是否存在待修复（wait/fail）组件，need=True 才进入确认修复阶段。"""
+        try:
+            self.q.put(("progress", 3))
+            self.q.put(("status", "accent", "正在检测组件状态…"))
+            # 优先用系统 Python，其次用已装 venv Python
+            py = self._find_python()
+            if not py:
+                venv_py = os.path.join(root, "runtime", "venv", "Scripts", "python.exe")
+                if os.path.isfile(venv_py):
+                    py = [venv_py]
+            if not py:
+                raise RuntimeError("未找到 Python 3.11，无法执行检测")
+            self.q.put(("comp", "python|ok|Python 3.11 已就绪"))
+            self.q.put(("log", "Python: " + " ".join(py)))
+
+            need = False
+            res = _src_root()
+            flow = os.path.join(_resource_dir(), "install_flow.py")
+            cmd = [*py, flow, "--root", root, "--src", res, "--check-only",
+                   "--dl-threads", str(getattr(self, "_dl_threads_val", 16))]
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                          stderr=subprocess.STDOUT,
+                                          encoding="utf-8", errors="replace",
+                                          creationflags=_NO_WINDOW)
+            for line in self._proc.stdout:
+                if self._cancel.is_set():
+                    break
+                line = line.rstrip()
+                if not line:
+                    continue
+                m = re.match(r"^\[([a-z]+)\]\s?(.*)$", line)
+                if m:
+                    tag, rest = m.group(1), m.group(2)
+                    if tag == "comp":
+                        self.q.put(("comp", rest))
+                        parts = rest.split("|")
+                        if len(parts) == 3 and _needs_repair(parts[0], parts[1]):
+                            need = True
+                        continue
+                    if tag == "pkg":
+                        self.q.put(("pkg", rest))
+                        continue
+                    self.q.put(("tag", f"[{tag}] {rest}",
+                                "stage" if tag in _TAG_STAGE else None))
+                else:
+                    self.q.put(("log", line))
+            self._proc.wait()
+            if self._cancel.is_set():
+                raise _Cancelled("用户停止检测")
+            if self._proc.returncode != 0:
+                raise RuntimeError("组件检测失败")
+            self.q.put(("check_done", root, need))
+        except _Cancelled:
+            # 检测阶段未产生任何修改，无需清理半成品
+            self.q.put(("done", False, True))
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("log", "错误：" + str(e)))
+            self.q.put(("done", False, False))
+
+    def _on_check_done(self, root, need=True):
+        """检测完成：need=True 存在待修复组件 → 展示「开始修复」等待确认；
+        need=False 所有组件正常 → 直接回到完成状态，不引导执行修复。"""
+        self._repair_root = root
+        self._checking = False
+        self._stop_flow_anim()
+        self._advance_progress(100)
+        self._append_log(">>> 检测完成（仅检测，未修改任何内容）", "ok")
+        if need:
+            self._set_activity("检测完成，请确认是否开始修复", fg="#2e7d32")
+            self._set_status("accent", "检测完成，请确认是否开始修复")
+            self._set_buttons("check_done")
+            self._append_log("· 请核对上方组件状态，确认无误后点击「开始修复」", "muted")
+        else:
+            self._set_activity("检测完成，所有组件正常，无需修复", fg="#2e7d32")
+            self._set_status("success", "检测完成，所有组件正常，无需修复")
+            self._set_buttons("done")
+            self._append_log("✓ 核心组件（主程序/环境/模型）均正常，无需修复", "ok")
+            # 可选增强项未启用时给出说明，避免用户看到 wait 状态却无修复入口而困惑
+            states = self.comps.get_states()
+            if states.get("cuda", ("", ""))[0] in ("wait", "fail"):
+                self._append_log("· GPU 加速未启用（当前为 CPU 模式，"
+                                 "如需加速可重新安装）", "muted")
+            if states.get("shortcut", ("", ""))[0] in ("wait", "fail"):
+                self._append_log("· 桌面快捷方式未创建（可打开安装目录手动启动）",
+                                 "muted")
+        self._refit_width()
+
+    def _confirm_repair(self):
+        """阶段二·修复：用户确认后执行实际修复（install_flow.py --repair）。"""
+        if self.worker and self.worker.is_alive():
+            return
+        root = getattr(self, "_repair_root", None) or (
+            _detect_installed_root() or self.path_var.get().strip())
+        if not root or not os.path.isdir(root):
+            messagebox.showwarning("提示", "安装目录不存在，请重新检测。")
+            self._set_buttons("idle")
+            return
+        if not self._close_running_app(root):
+            return
+        self._cancel.clear()
+        self._paused = False
+        self._proc = None
+        self._pysetup = None
+        self._checking = False
+        self._safe_unlink(os.path.join(root, ".install_pause"))
+        self._stage_now = -1
+        self._progress = 0
+        self._advance_progress(0, force=True)
+        self.comps.reset()
+        self._comps_checking()
+        self._running = True
+        self._t0 = time.time()
+        self._set_buttons("running")
+        self._set_activity("正在修复…", stopwatch=True, fg=INK)
+        self.worker = threading.Thread(target=self._run_repair, args=(root,), daemon=True)
+        self.worker.start()
+        self.after(80, self._poll)
+
+    def _run_repair(self, root):
+        """修复模式 worker：运行 install_flow.py --repair。"""
+        try:
+            self.q.put(("progress", 3))
+            self.q.put(("status", "accent", "正在修复…"))
+            self.q.put(("log", "· 用户已确认，开始执行修复"))
+            # 优先用系统 Python，其次用已装 venv Python
+            py = self._find_python()
+            if not py:
+                venv_py = os.path.join(root, "runtime", "venv", "Scripts", "python.exe")
+                if os.path.isfile(venv_py):
+                    py = [venv_py]
+            if not py:
+                raise RuntimeError("未找到 Python 3.11，无法执行修复")
+            self.q.put(("comp", "python|ok|Python 3.11 已就绪"))
+            self.q.put(("log", "Python: " + " ".join(py)))
+
+            res = _src_root()
+            flow = os.path.join(_resource_dir(), "install_flow.py")
+            result = os.path.join(root, "install_result.json")
+            pause_file = os.path.join(root, ".install_pause")
+            cmd = [*py, flow, "--root", root, "--src", res, "--result", result,
+                   "--pause-file", pause_file, "--repair",
+                   "--dl-threads", str(getattr(self, "_dl_threads_val", 16)),
+                   *([] if self.shortcut_var.get() else ["--no-shortcut"])]
+            self.q.put(("stage", "copy"))
+            self.q.put(("progress", 10))
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                          stderr=subprocess.STDOUT,
+                                          encoding="utf-8", errors="replace",
+                                          creationflags=_NO_WINDOW)
+            stage_now = 0
+            for line in self._proc.stdout:
+                if self._cancel.is_set():
+                    break
+                line = line.rstrip()
+                if not line:
+                    continue
+                m = re.match(r"^\[([a-z]+)\]\s?(.*)$", line)
+                if m:
+                    tag, rest = m.group(1), m.group(2)
+                    if tag == "pkg":
+                        self.q.put(("pkg", rest))
+                        continue
+                    if tag == "mbeat":
+                        self.q.put(("mbeat", rest))
+                        continue
+                    if tag == "theat":
+                        self.q.put(("theat", rest))
+                        continue
+                    if tag == "comp":
+                        self.q.put(("comp", rest))
+                        continue
+                    self.q.put(("tag", f"[{tag}] {rest}",
+                                "stage" if tag in _TAG_STAGE else None))
+                    if tag in _TAG_STAGE:
+                        stage_now = _TAG_STAGE[tag]
+                        self.q.put(("stage", tag))
+                    if tag == "pause":
+                        if "已暂停" in rest:
+                            self.q.put(("status", "accent", "已暂停（点击「继续」恢复）"))
+                        elif "已恢复" in rest:
+                            self.q.put(("status", "accent", "修复中…"))
+                    if tag == "model" and stage_now == 2:
+                        mm = re.search(r"\((\d+)/(\d+)\)", rest)
+                        if mm and "失败" not in rest:
+                            d, t = int(mm.group(1)), int(mm.group(2))
+                            if t:
+                                self.q.put(("progress", 50 + 25 * d // t))
+                else:
+                    self.q.put(("log", line))
+            self._proc.wait()
+            if self._cancel.is_set():
+                raise _Cancelled("用户停止修复")
+            if self._proc.returncode != 0:
+                raise RuntimeError("修复过程出错")
+            self.q.put(("progress", 100))
+            self.q.put(("log", ">>> 检测修复完成"))
+            sc = 0
+            try:
+                with open(result, encoding="utf-8") as fh:
+                    rj = json.load(fh)
+                if "shortcut_ok" in rj:
+                    sc = 1 if rj["shortcut_ok"] else 2
+            except Exception:
+                pass
+            for tmp in ("install_result.json", ".install_state.json",
+                        ".install_pause", "python-setup.exe"):
+                self._safe_unlink(os.path.join(root, tmp))
+            self.q.put(("done", True, False, sc))
+        except _Cancelled:
+            self._cleanup_after_stop(root)
+            self.q.put(("done", False, True))
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("log", "错误：" + str(e)))
+            self.q.put(("done", False, False))
 
     # ---- 暂停 / 停止 ----
     def _toggle_pause(self):
@@ -1125,6 +2106,67 @@ class Installer(tk.Tk):
             except Exception:
                 pass
 
+    def _find_app_procs(self, root):
+        """返回运行中且可执行文件位于安装目录（root）下的 (pid, exe) 列表。
+        这些进程会锁定主程序 exe/DLL，安装或修复覆盖前必须先关闭。"""
+        root = os.path.normcase(os.path.abspath(root))
+        found = []
+        if psutil is not None:
+            try:
+                for p in psutil.process_iter(["pid", "exe"]):
+                    try:
+                        exe = p.info.get("exe")
+                    except Exception:
+                        exe = None
+                    if exe and os.path.normcase(
+                            os.path.abspath(exe)).startswith(root):
+                        found.append((p.info["pid"], exe))
+            except Exception:
+                pass
+        else:
+            # 回退：PowerShell 按 ExecutablePath 前缀枚举（无 psutil 环境）
+            try:
+                ps = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "$ps=Get-CimInstance Win32_Process | Where-Object { "
+                     "$_.ExecutablePath -and $_.ExecutablePath.ToLower()"
+                     ".StartsWith('" + root.lower() + "') }; "
+                     "$ps | ForEach-Object { $_.ProcessId.ToString()+'|'+"
+                     "$_.ExecutablePath }"],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=_NO_WINDOW)
+                for line in ps.stdout.splitlines():
+                    if "|" in line:
+                        pid, exe = line.split("|", 1)
+                        found.append((int(pid), exe))
+            except Exception:
+                pass
+        return found
+
+    def _close_running_app(self, root):
+        """检测并关闭运行中的 MinerU（锁定主程序文件）。返回 False 表示用户取消。"""
+        procs = self._find_app_procs(root)
+        if not procs:
+            return True
+        names = sorted({os.path.basename(e) for _, e in procs})
+        detail = "、".join(names[:5]) + (" 等" if len(names) > 5 else "")
+        if not messagebox.askyesno(
+                "MinerU 正在运行",
+                f"检测到正在运行的 MinerU（{detail}，共 {len(procs)} 个进程）。\n\n"
+                "安装/修复需要覆盖主程序文件，请先关闭它。\n"
+                "是否立即关闭这些进程并继续？"):
+            return False
+        self._append_log(f"· 已关闭 {len(procs)} 个正在运行的 MinerU 进程"
+                         f"（{detail}）", "warn")
+        for pid, _ in procs:
+            try:
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, timeout=30,
+                               creationflags=_NO_WINDOW)
+            except Exception:
+                pass
+        return True
+
     def _safe_unlink(self, path):
         try:
             if os.path.exists(path):
@@ -1133,7 +2175,10 @@ class Installer(tk.Tk):
             pass
 
     def _cleanup_after_stop(self, root):
-        """停止安装后清理半成品：暂停标志、结果文件、未完成下载、半成品环境。"""
+        """停止安装后清理半成品：暂停标志、结果文件、未完成下载、半成品环境。
+        检测阶段（_checking）只读未产生任何内容，直接返回避免误删已装环境。"""
+        if getattr(self, "_checking", False):
+            return
         steps = set()
         try:
             with open(os.path.join(root, ".install_state.json"), encoding="utf-8") as f:
@@ -1218,8 +2263,21 @@ class Installer(tk.Tk):
                     self._set_status(item[1], item[2])
                 elif kind == "stage":
                     self._update_stage(item[1])
+                elif kind == "activity":
+                    self._set_activity(item[1], stopwatch=True, fg=INK)
                 elif kind == "progress":
                     self._advance_progress(item[1])
+                elif kind == "check_done":
+                    self._on_check_done(item[1],
+                                        item[2] if len(item) > 2 else True)
+                    return
+                elif kind == "update_done":
+                    self._on_update_done(item[1])
+                    return
+                elif kind == "update_finish":
+                    self._on_update_finish(item[1],
+                                           item[2] if len(item) > 2 else None)
+                    return
                 elif kind == "done":
                     self._finish(item[1], item[2],
                                  item[3] if len(item) > 3 else 0)
@@ -1233,44 +2291,65 @@ class Installer(tk.Tk):
         self._running = False
         self._act_t0 = None
         self.spin.delete("all")
+        was_check = getattr(self, "_checking", False)
+        done_txt = "检测修复完成" if self._repair_mode else "安装完成"
+        # 确保所有待处理的 UI 事件已刷新（组件面板等）
+        self.update_idletasks()
         if ok:
-            self._set_activity("安装完成", fg="#2e7d32")
+            # 成功完成：将仍处于进行中/等待状态的组件标记为 "ok"
+            for cid, (status, detail) in self.comps.get_states().items():
+                if status in ("installing", "downloading", "checking", "wait"):
+                    self.comps.set_comp(cid, "ok", detail or "已就绪")
+            self.comps.finalize_feeds()
+            self._set_activity(done_txt, fg="#2e7d32")
         elif cancelled:
-            self._set_activity("安装已停止", fg=DANGER)
+            self._set_activity(("检测" if was_check else "安装") + "已停止", fg=DANGER)
         else:
-            self._set_activity("安装失败，详见日志", fg=DANGER)
+            self._set_activity(("检测" if was_check else "安装") + "失败，详见日志", fg=DANGER)
         for i in range(len(STAGES)):
             self._draw_step(i, "done" if ok else "pending")
         for j in range(len(self._links)):
             self._draw_link(j)
         if ok:
             self._advance_progress(100)
-            self._set_status("success", "安装完成")
+            self._set_status("success", done_txt)
         elif cancelled:
-            self._set_status("error", "已停止")
-            self._append_log("■ 安装已停止", "err")
+            self._set_status("error", ("检测" if was_check else "安装") + "已停止")
+            self._append_log("■ " + ("检测" if was_check else "安装") + "已停止", "err")
         else:
-            self._set_status("error", "安装失败")
+            self._set_status("error", ("检测" if was_check else "安装") + "失败")
         self._set_buttons("done" if ok or not cancelled else "idle")
+        self._refit_width()   # 完成/恢复维护按钮后重算宽度，防新增按钮溢出
         if ok:
             self.btn_open.grid()
             if sc == 1:
-                self._append_log("✔ 安装完成，已生成桌面快捷方式", "ok")
+                self._append_log(f"✔ {done_txt}，已生成桌面快捷方式", "ok")
+            elif sc == 2:
+                self._append_log(f"✔ {done_txt}（桌面快捷方式创建失败，可打开安装目录手动启动）", "ok")
+            else:
+                self._append_log(f"✔ {done_txt}", "ok")
+            if self._log_path:
+                self._append_log(f"· 日志已保存：{self._log_path}", "muted")
+            self._close_log_file()
+            if sc == 1:
                 messagebox.showinfo(
-                    "完成", "安装完成！\n\n已在桌面创建「MinerU 文档解析」快捷方式，"
+                    "完成", f"{done_txt}！\n\n已在桌面创建「MinerU 文档解析」快捷方式，"
                     "双击即可一键启动。")
             elif sc == 2:
-                self._append_log("✔ 安装完成（桌面快捷方式创建失败，可打开安装目录手动启动）", "ok")
                 messagebox.showinfo(
-                    "完成", "安装完成！\n\n桌面快捷方式创建失败，"
+                    "完成", f"{done_txt}！\n\n桌面快捷方式创建失败，"
                     "可点击「打开安装目录」手动启动（MinerU文档解析 文件夹内的 exe）。")
             else:
-                self._append_log("✔ 安装完成", "ok")
                 messagebox.showinfo(
-                    "完成", "安装完成！\n\n可点击「打开安装目录」查看文件与使用说明。")
+                    "完成", f"{done_txt}！\n\n可点击「打开安装目录」查看文件与使用说明。")
             self._open_guide()
         elif not cancelled:
+            if self._log_path:
+                self._append_log(f"· 安装日志已保存：{self._log_path}", "muted")
+            self._close_log_file()
             messagebox.showerror("失败", "安装未完成，请查看上方日志。")
+        else:
+            self._close_log_file()
 
     def _on_close(self):
         if self.worker and self.worker.is_alive():
@@ -1283,6 +2362,7 @@ class Installer(tk.Tk):
             self._kill_proc_tree(self._proc)
             self._kill_proc_tree(self._pysetup)
             self._cleanup_after_stop(root)
+        self._close_log_file()
         self.destroy()
 
     def _find_guide(self):
@@ -1326,9 +2406,13 @@ class Installer(tk.Tk):
                     pass
         return None
 
-    def _download_python(self, dest_dir):
+    def _download_python(self):
+        """自动下载安装 Python 3.11。安装包落 %TEMP%（此前落安装根目录，
+        装完残留 ~25MB），用完即删，安装目录保持结构化。"""
         self.q.put(("log", "未找到 Python 3.11，正在自动下载 ..."))
-        installer = os.path.join(dest_dir, "python-setup.exe")
+        tmp_dir = os.path.join(tempfile.gettempdir(), "MinerU_installer")
+        os.makedirs(tmp_dir, exist_ok=True)
+        installer = os.path.join(tmp_dir, "python-setup.exe")
 
         def _cancel_hook(_blocks, _bs, _total):
             if self._cancel.is_set():
@@ -1350,11 +2434,14 @@ class Installer(tk.Tk):
         self._pysetup = subprocess.Popen(
             [installer, "/quiet", "InstallAllUsers=0", "PrependPath=0", "Include_test=0"],
             creationflags=_NO_WINDOW)
-        while self._pysetup.poll() is None:
-            if self._cancel.is_set():
-                self._kill_proc_tree(self._pysetup)
-                raise _Cancelled("用户停止安装")
-            time.sleep(0.5)
+        try:
+            while self._pysetup.poll() is None:
+                if self._cancel.is_set():
+                    self._kill_proc_tree(self._pysetup)
+                    raise _Cancelled("用户停止安装")
+                time.sleep(0.5)
+        finally:
+            self._safe_unlink(installer)   # 安装包用完即删，不留临时文件
         return self._find_python()
 
     def _run(self, root):
@@ -1367,7 +2454,7 @@ class Installer(tk.Tk):
                 self.q.put(("comp", "python|ok|系统已有 Python 3.11"))
             else:
                 self.q.put(("comp", "python|installing|未检测到，正在自动下载安装 …"))
-                py = self._download_python(root)
+                py = self._download_python()
                 if py:
                     self.q.put(("comp", "python|ok|Python 3.11 已自动安装"))
             if not py:
@@ -1447,6 +2534,11 @@ class Installer(tk.Tk):
                     sc = 1 if rj["shortcut_ok"] else 2
             except Exception:
                 pass
+            # 安装成功：清掉流程临时文件，安装根只留结构化内容
+            # （主程序/ runtime/ 卸载器/ 使用说明/ mineru.json/ .install_manifest.json）
+            for tmp in ("install_result.json", ".install_state.json",
+                        ".install_pause", "python-setup.exe"):
+                self._safe_unlink(os.path.join(root, tmp))
             self.q.put(("done", True, False, sc))
         except _Cancelled:
             self._cleanup_after_stop(root)
@@ -1474,104 +2566,28 @@ def _detect_installed_root():
     return None
 
 
-def _run_updater(root):
-    """修复/升级：以已装 venv python 拉起更新器 GUI（对比远端 manifest 只补差异）。
-    更新器脚本先复制到系统临时目录——安装器 onefile 退出会清理 _MEIPASS。"""
-    venv_py = os.path.join(root, "runtime", "venv", "Scripts", "python.exe")
-    if not os.path.isfile(venv_py):
-        messagebox.showerror(
-            "无法修复",
-            f"未找到运行环境：\n{venv_py}\n\n运行环境损坏时无法联网修复，请选择「重新安装」。")
-        return False
-    src_dir = _resource_dir()
-    src_updater = os.path.join(src_dir, "updater.py")
-    src_fastdl = os.path.join(src_dir, "fastdl.py")
-    if not os.path.isfile(src_updater) or not os.path.isfile(src_fastdl):
-        messagebox.showerror("无法修复", "安装包缺少更新组件（updater/fastdl）。")
-        return False
-    tmp = os.path.join(tempfile.gettempdir(), "MinerUUpdater")
-    os.makedirs(tmp, exist_ok=True)
-    shutil.copy2(src_updater, os.path.join(tmp, "updater.py"))
-    shutil.copy2(src_fastdl, os.path.join(tmp, "fastdl.py"))
-    subprocess.Popen(
-        [venv_py, os.path.join(tmp, "updater.py"), "--gui", "--root", root],
-        creationflags=_NO_WINDOW)
-    return True
-
-
-def _offer_existing_actions(parent):
-    """检测到已安装：三选（修复/升级 · 重新安装 · 卸载）。
-    返回 'update' / 'uninstall' / None（None=继续默认安装流程）。"""
-    root = _detect_installed_root()
-    if not root:
-        return None
-    ver = "未知"
+def _installed_version(root):
+    """读取已安装版本号（清单缺失返回 '未知'）。"""
     try:
         with open(os.path.join(root, ".install_manifest.json"), encoding="utf-8") as f:
-            ver = json.load(f).get("version", "未知")
+            return str(json.load(f).get("version", "未知"))
     except Exception:
-        pass
+        return "未知"
 
-    dlg = tk.Toplevel(parent)
-    dlg.title("检测到已安装的 MinerU")
-    dlg.configure(bg=BG)
-    dlg.resizable(False, False)
-    dlg.grab_set()
-    result = {"act": None}
 
-    body = tk.Frame(dlg, bg=BG, padx=28, pady=22)
-    body.pack(fill="both", expand=True)
-    tk.Label(body, text=f"已安装版本 v{ver}", bg=BG, fg=INK,
-             font=(FONT, 14, "bold")).pack(anchor="w")
-    tk.Label(body, text=f"安装位置：{root}", bg=BG, fg=MUTED,
-             font=(FONT, 10)).pack(anchor="w", pady=(6, 2))
-    tk.Label(body, text="· 修复/升级：联网对比远程清单，只下载损坏或过期的文件（推荐）\n"
-                        "· 重新安装：完整覆盖安装（环境/模型重建，耗时较长）\n"
-                        "· 卸载：停止服务并清理全部文件",
-             bg=BG, fg=MUTED, font=(FONT, 10), justify="left").pack(
-        anchor="w", pady=(10, 16))
-
-    btns = tk.Frame(body, bg=BG)
-    btns.pack(fill="x")
-
-    def _close(act):
-        result["act"] = act
-        dlg.destroy()
-
-    def do_update():
-        if _run_updater(root):
-            _close("exit")
-
-    def do_uninstall():
-        un = os.path.join(root, "卸载MinerU.exe")
-        if not os.path.isfile(un):
-            messagebox.showerror("无法卸载", f"未找到卸载程序：\n{un}", parent=dlg)
-            return
-        subprocess.Popen([un], creationflags=_NO_WINDOW)
-        _close("exit")
-
-    for text, cmd, kind in (
-            ("修复 / 升级", do_update, "primary"),
-            ("重新安装", lambda: _close(None), "secondary"),
-            ("卸载", do_uninstall, "ghost")):
-        GradButton(btns, text, command=cmd, kind=kind).pack(
-            side="left", padx=(0, 12))
-
-    dlg.protocol("WM_DELETE_WINDOW", lambda: _close(None))
-    dlg.bind("<Escape>", lambda e: _close(None))
-    dlg.update_idletasks()
-    _dark_titlebar(dlg)
-    dlg.transient(parent)
-    _cx = dlg.winfo_screenwidth() // 2 - dlg.winfo_reqwidth() // 2
-    _cy = dlg.winfo_screenheight() // 2 - dlg.winfo_reqheight() // 2
-    dlg.geometry(f"+{_cx}+{_cy}")
-    dlg.wait_window()
-    return result["act"]
+def _ver_tuple(v):
+    """版本字符串 'x.y.z[.build]' → 数字元组，用于大小比较。
+    支持任意段数（发布版带构建时间戳，如 1.0.0.202609051215），
+    无法解析返回 (0, 0, 0)。"""
+    parts = re.findall(r"\d+", str(v).strip())
+    if not parts:
+        return (0, 0, 0)
+    t = tuple(int(x) for x in parts)
+    return t if len(t) >= 3 else t + (0,) * (3 - len(t))
 
 
 def main():
     app = Installer()
-    app.after(400, lambda: app._maybe_offer_existing())
     app.mainloop()
 
 

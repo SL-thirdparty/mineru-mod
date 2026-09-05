@@ -12,6 +12,10 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(SPEC)), "..
 
 def _datas():
     d = []
+    # 窗口图标（运行时 iconbitmap 用）
+    p_icon = os.path.join(ROOT, "src", "tray", "icon.ico")
+    if os.path.isfile(p_icon):
+        d.append((p_icon, "."))
     # 应用主程序（onedir：托盘启动器 + 内嵌 WebUI 字节码）
     p_app = os.path.join(ROOT, "release", "MinerU文档解析")
     if os.path.isdir(p_app):
@@ -40,6 +44,11 @@ def _datas():
     p_guide = os.path.join(ROOT, "release", "使用说明.html")
     if os.path.isfile(p_guide):
         d.append((p_guide, "."))
+    # 构建信息（版本带构建时间戳）：install_flow 安装时写入本地清单版本，
+    # 与 publish_dist 的 dist manifest 版本同源，保证「新装即最新」判定一致
+    p_build = os.path.join(ROOT, "release", "build_info.json")
+    if os.path.isfile(p_build):
+        d.append((p_build, "."))
     return d
 
 a = Analysis(

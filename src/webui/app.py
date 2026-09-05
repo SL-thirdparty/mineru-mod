@@ -47,9 +47,65 @@ OUTPUTS = DATA / "outputs"
 STATIC = Path(__file__).resolve().parent / "static"
 CONFIG_JSON = ROOT / "mineru.json"
 MODEL_CACHE = RUNTIME / "models_cache"
+LOGS = ROOT / "logs"                           # 统一日志目录（安装根，与 runtime/ 平级）
+
+# 引擎子进程 cwd 继承本进程（官方 api_client 以 cwd=os.getcwd() 拉起 mineru-api），
+# 固定为安装根（models-dir 已写绝对路径，cwd 仅作兜底；整目录迁移后依然可用）。
+os.chdir(str(ROOT))
 
 UPLOADS.mkdir(parents=True, exist_ok=True)
 OUTPUTS.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_models_dir_absolute():
+    """幂等修正 mineru.json：models-dir.pipeline 为相对路径时改写为绝对路径。
+    旧版安装器写的是相对路径（相对安装根），引擎 cwd 一旦不是安装根就会把
+    路径当 repo_id 传给 transformers 触发 HFValidationError；此处自动修复存量安装。"""
+    try:
+        with open(CONFIG_JSON, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return
+    md = cfg.get("models-dir") if isinstance(cfg, dict) else None
+    rel = (md or {}).get("pipeline") if isinstance(md, dict) else None
+    if not isinstance(rel, str) or not rel:
+        return
+    if os.path.isabs(rel) or re.match(r"^[A-Za-z]:[\\/]", rel):
+        return
+    abs_p = os.path.normpath(os.path.join(str(ROOT), rel.replace("/", os.sep)))
+    if not os.path.isdir(abs_p):
+        print(f"[cfg] models-dir 相对路径解析不到模型目录，跳过改写: {rel}", flush=True)
+        return
+    md["pipeline"] = abs_p.replace("\\", "/")
+    try:
+        with open(CONFIG_JSON, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        print(f"[cfg] mineru.json models-dir 已由相对路径修正为绝对路径: {abs_p}", flush=True)
+    except OSError as e:
+        print(f"[cfg] 改写 mineru.json 失败: {e}", flush=True)
+
+
+def _migrate_legacy_logs():
+    """旧版本日志位于 runtime/_data/logs，统一迁至安装根 logs/（保留历史，幂等）。"""
+    old = DATA / "logs"
+    if not old.is_dir():
+        return
+    try:
+        LOGS.mkdir(parents=True, exist_ok=True)
+        for p in old.iterdir():
+            if p.is_file():
+                try:
+                    shutil.move(str(p), str(LOGS / p.name))
+                except OSError:
+                    pass
+        if not any(old.iterdir()):
+            old.rmdir()
+    except OSError:
+        pass
+
+
+_ensure_models_dir_absolute()
+_migrate_legacy_logs()
 
 # ---------------- 运行日志（每次运行清空之前的日志） ----------------
 # 日志目录默认取 exe 所在目录下的 logs（托盘启动时经 MINERU_LOG_DIR 传入），
@@ -69,9 +125,7 @@ def _logs_dir():
     d = os.environ.get("MINERU_LOG_DIR")
     if d:
         return Path(d)
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent / "logs"
-    return DATA / "logs"   # runtime/_data/logs，日志随运行态存放
+    return LOGS   # 安装根 logs/：与 runtime/ 平级，日志独立于运行数据（_data 仅存 uploads/outputs）
 
 
 def _clean_old_logs(logs_dir):

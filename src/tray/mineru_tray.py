@@ -40,7 +40,7 @@ MODEL_CACHE = os.path.join(RUNTIME, "models_cache")
 CONFIG_JSON = os.path.join(MINERU_ROOT, "mineru.json")
 
 # ---------------- 运行日志（每次运行清空之前的日志） ----------------
-# 日志目录默认取 exe 所在目录下的 logs；未打包（源码运行）时回退到项目根 logs。
+# 日志统一落安装根 logs/（与 WebUI/安装器/诊断日志一致），runtime/_data 仅存运行数据。
 # 文件名 = 软件名称_日期_时间，每次启动新建一个文件。
 APP_LOG_NAME = "MinerU"
 
@@ -49,8 +49,7 @@ def _logs_dir():
     d = os.environ.get("MINERU_LOG_DIR")
     if d:
         return Path(d)
-    # 统一写入安装根 runtime/_data/logs（保持应用目录纯净，便于远程对比修复）
-    return Path(RUNTIME) / "_data" / "logs"
+    return Path(MINERU_ROOT) / "logs"
 
 
 def _clean_old_logs(logs_dir):
@@ -139,6 +138,7 @@ def ensure_service():
     PROC = subprocess.Popen(
         SERVICE_ARGS,
         env=env,
+        cwd=str(MINERU_ROOT),  # 与 webui 内 chdir 一致：引擎子进程 cwd 稳定为安装根
         stdout=logf, stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
     )

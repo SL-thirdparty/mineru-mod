@@ -273,6 +273,20 @@ class FastDLTest(unittest.TestCase):
         self.assertEqual(ok, ["e"])
         self.assertEqual(dl.counter.bytes, 0)      # 未产生下载流量
 
+    def test_small_file_creates_missing_dirs(self):
+        """回归：小文件（< seg_size 走整下路径）的 dest 父目录不存在时，
+        add() 应自动创建目录链，而非把 FileNotFoundError 误判为源故障
+        （线上表现：TabCls/TabRec 下 3 个 onnx 永久失败）。"""
+        data = b"onnx-like small model"
+        _State.files["m"] = data
+        dest = os.path.join(self.dir, "models", "TabRec", "UnetStructure", "unet.onnx")
+        dl = self._dl()
+        dl.add("m", dest, len(data), _sha(data))
+        ok, fail = dl.run_with_retry(rounds=1)
+        self.assertEqual(ok, ["m"])
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), data)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

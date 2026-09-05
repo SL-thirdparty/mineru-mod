@@ -14,10 +14,12 @@
 import ctypes
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 
 # GUI（pythonw/打包 exe，无控制台）启动子进程时避免弹出黑色控制台窗口
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -97,6 +99,7 @@ _RE_UV_INSTALLED = re.compile(r"^Installed (\d+) packages? in ([\d.]+m?s)$")
 _RE_PIP_WHL = re.compile(r"^Downloading (\S+\.whl) \(([\d.]+\s*[KM]B)\)$")
 _RE_PIP_COLLECT = re.compile(r"^Collecting ([A-Za-z0-9_.\[\]-]+)")
 _RE_PIP_OK = re.compile(r"^Successfully installed (.+)$")
+_RE_PIP_INSTALLING = re.compile(r"^Installing collected packages: (.+)$")
 
 
 def _translate_uv(line):
@@ -126,6 +129,9 @@ def _translate_uv(line):
     m = _RE_PIP_COLLECT.match(s)
     if m:
         return "down|%s|" % m.group(1).split("==")[0].split(">=")[0].split("<")[0], False
+    m = _RE_PIP_INSTALLING.match(s)
+    if m:  # pip 下载完成后进入安装阶段：Installing collected packages: ...
+        return f"installing|{m.group(1).split()[0].rstrip(',')}|", False
     m = _RE_PIP_OK.match(s)
     if m:
         return f"installed|{len(m.group(1).split())}|", False
@@ -152,6 +158,12 @@ def run_tee(cmd):
 
 def run_visible(cmd, tee):
     """统一走管道捕获：uv/pip 的 stdout+stderr 实时回显到终端并写入日志。
+
+    停滞兜底：读循环超过 MINERU_STALL_TIMEOUT 秒（默认 180）无任何新输出，
+    判定当前下载源停滞（连接已建立但数据不流动，uv/pip 自身可能永不超时），
+    强制终止子进程并返回失败码 → 调用方自动换下一个镜像源 / 回退 pip 重试，
+    绝不无限挂起。
+
     取舍：虽然 TTY 下 uv/pip 的原生动画进度条因此退化为逐行文本（每行仍含包名/大小），
     但失败原因不再丢失——实体机上无法装通 torch 时，报错能完整落盘供回传定位，比进度条更关键。
     保留 tee 形参以兼容所有调用点，实际恒为管道模式。
@@ -160,7 +172,34 @@ def run_visible(cmd, tee):
     emit(f"$ {' '.join(cmd)}")
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, errors="replace", creationflags=_NO_WINDOW)
-    for line in p.stdout:
+    stall = float(os.environ.get("MINERU_STALL_TIMEOUT", "180"))
+    q = queue.Queue()
+
+    def _reader():
+        for line in p.stdout:
+            q.put(line)
+        q.put(None)                       # EOF 哨兵
+
+    threading.Thread(target=_reader, daemon=True).start()
+    while True:
+        try:
+            line = q.get(timeout=stall)
+        except queue.Empty:
+            emit(red(f"        ✗ 下载停滞超过 {int(stall)} 秒无进展，"
+                     "终止当前安装器以切换源重试"))
+            try:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                               capture_output=True, timeout=30,
+                               creationflags=_NO_WINDOW)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            p.wait()
+            return 1
+        if line is None:
+            break
         raw = line.rstrip("\n")
         event, noise = _translate_uv(raw)
         if noise:
@@ -348,7 +387,15 @@ class Diagnostics:
 
     def __init__(self, root):
         import datetime
-        self.path = os.path.join(root, "sysdiag_%s.log" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        # 日志统一落安装根 logs/（与托盘/WebUI/安装流程一致；runtime/_data 仅存运行数据）
+        log_dir = os.path.join(root, "logs")
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            self.path = os.path.join(
+                log_dir, "sysdiag_%s.log" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        except OSError:
+            self.path = os.path.join(
+                root, "sysdiag_%s.log" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         self.lines = []
         self.header(root)
 
@@ -453,6 +500,17 @@ class Installer:
         self.vpy = os.path.join(self.venv, "Scripts", "python.exe")
         self.uv = find_uv()
         self._mirror_order = None   # 测速后源序（None=未测速，用固定优先序）
+        # 下载缓存收进安装目录：uv 默认写 %LOCALAPPDATA%\uv（本机实测累积
+        # 38GB+，卸载器也无法感知清理）。重定向后所有包缓存随 runtime/pkg_cache
+        # 结构化落盘；安装成功后由 install_flow 统一清理，失败保留供续装。
+        pkg_cache = os.path.join(root, "runtime", "pkg_cache")
+        os.environ["UV_CACHE_DIR"] = os.path.join(pkg_cache, "uv")
+        os.environ["PIP_CACHE_DIR"] = os.path.join(pkg_cache, "pip")
+        try:
+            os.makedirs(os.environ["UV_CACHE_DIR"], exist_ok=True)
+            os.makedirs(os.environ["PIP_CACHE_DIR"], exist_ok=True)
+        except OSError:
+            pass
 
     def mirror_sources(self):
         if self._mirror_order:
@@ -542,6 +600,31 @@ class Installer:
                 return True
             emit(yellow("       ↻ uv 源均失败，回退 pip（镜像多源 → 官方兜底）"))
         return self._install_with_pip(specs)
+
+    # ---- 安装状态检测（修复/重装时避免重复下载安装）----
+    def specs_ok(self):
+        """site-packages 中直接依赖（mineru/pywin32/pystray）是否齐全（dist-info 探测）。"""
+        sp = os.path.join(self.venv, "Lib", "site-packages")
+        if not os.path.isdir(sp):
+            return False
+        have = set()
+        for n in os.listdir(sp):
+            low = n.lower()
+            if low.startswith("mineru-"):
+                have.add("mineru")
+            elif low.startswith("pywin32-"):
+                have.add("pywin32")
+            elif low.startswith("pystray-"):
+                have.add("pystray")
+        return {"mineru", "pywin32", "pystray"} <= have
+
+    def torch_cuda_ok(self):
+        """venv 是否已装 CUDA 版 torch（torch-*+cu*.dist-info 存在；CPU 版为 +cpu）。"""
+        sp = os.path.join(self.venv, "Lib", "site-packages")
+        if not os.path.isdir(sp):
+            return False
+        return any(low.startswith("torch-") and low.endswith(".dist-info") and "+cu" in low
+                   for low in (n.lower() for n in os.listdir(sp)))
 
     def _install_with_uv(self, specs):
         for src in self.mirror_sources():
@@ -808,9 +891,14 @@ class Installer:
     # ---- 步骤 4：生成 mineru.json ----
     def write_config(self):
         emit(cyan("[4/4] 生成 mineru.json 指向模型目录 ..."))
-        cache = os.path.join(self.root, "runtime", "models_cache")
-        kit = os.path.join(cache, "models", "OpenDataLab--PDF-Extract-Kit-1.0", "snapshots", "master")
-        base = kit if os.path.isdir(kit) else cache
+        # 模型固定下载于 kit（install_flow.download_models / check_model 同源）。
+        # 写绝对路径：models-dir 不再依赖进程 cwd，任何启动方式（托盘/快捷方式/
+        # 直接双击 exe）引擎都能正确定位本地模型；相对路径在 cwd≠安装根时会被
+        # transformers 当作 repo_id 触发 HFValidationError（已实测复现）。
+        # 整目录迁移场景由 WebUI 启动时的 _ensure_models_dir_absolute 幂等兜底。
+        base = os.path.normpath(os.path.join(
+            self.root, "runtime", "models_cache", "models",
+            "OpenDataLab--PDF-Extract-Kit-1.0", "snapshots", "master"))
         cfg = {"models-dir": {"pipeline": base.replace("\\", "/")}, "model-source": "modelscope"}
         path = os.path.join(self.root, "mineru.json")
         with open(path, "w", encoding="utf-8") as f:
@@ -842,7 +930,13 @@ def main():
         emit(cyan("  [离线 torch] 已启用本地 wheel 目录: " + local_torch_dir))
 
     global LOG
-    LOG = open(os.path.join(root, "install_mineru_uv.log"), "w", encoding="utf-8")
+    # 日志统一落安装根 logs/（与托盘/WebUI/诊断日志一致；runtime/_data 仅存运行数据）
+    _log_dir = os.path.join(root, "logs")
+    try:
+        os.makedirs(_log_dir, exist_ok=True)
+        LOG = open(os.path.join(_log_dir, "install_mineru_uv.log"), "w", encoding="utf-8")
+    except OSError:
+        LOG = open(os.path.join(root, "install_mineru_uv.log"), "w", encoding="utf-8")
     diag = Diagnostics(root)
     diag_result = ""
     try:
@@ -892,6 +986,8 @@ def main():
         diag_result = diag.write()
         emit(cyan("  诊断日志(回传用): " + diag_result))
         emit(cyan("  将该文件回传，实体机异常即可据此定位。"))
+        # 成功后清理包缓存（与 install_flow 策略一致；失败保留供续装）
+        shutil.rmtree(os.path.join(root, "runtime", "pkg_cache"), ignore_errors=True)
         return 0
     except Exception as e:  # noqa: BLE001
         import traceback

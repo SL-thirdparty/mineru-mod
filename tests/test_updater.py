@@ -92,14 +92,28 @@ class UpdaterTest(unittest.TestCase):
         self.root = tempfile.mkdtemp(prefix="upd_root_")
         os.environ["MINERU_UPDATE_BASES"] = self.srv.base
         self._real_run = updater.subprocess.run
+        self._real_urlopen = updater.urllib.request.urlopen
 
         class _FakeCompleted:
             stdout = ""      # _stop_tray 读取 tasklist 结果
 
-        updater.subprocess.run = lambda *a, **k: _FakeCompleted()  # 屏蔽 taskkill/tasklist
+        updater.subprocess.run = lambda *a, **k: _FakeCompleted()  # 屏蔽 taskkill/tasklist/netstat
+        # 仅屏蔽优雅停 WebUI 的 /api/shutdown（测试环境不得影响真实运行中的服务），
+        # fetch_manifest 拉取测试源仍走真实 urlopen
+        _real_urlopen = updater.urllib.request.urlopen
+
+        def _guarded(*a, **k):
+            req = a[0] if a else None
+            url = getattr(req, "full_url", "") or ""
+            if "/api/shutdown" in url:
+                raise RuntimeError("test: shutdown disabled")
+            return _real_urlopen(*a, **k)
+
+        updater.urllib.request.urlopen = _guarded
 
     def tearDown(self):
         updater.subprocess.run = self._real_run
+        updater.urllib.request.urlopen = self._real_urlopen
         os.environ.pop("MINERU_UPDATE_BASES", None)
         self.srv.stop()
         shutil.rmtree(self.root, ignore_errors=True)
@@ -123,17 +137,18 @@ class UpdaterTest(unittest.TestCase):
                 f.write(b)
         with open(os.path.join(self.root, updater.MANIFEST_LOCAL), "w",
                   encoding="utf-8") as f:
-            json.dump({"version": version, "files": {}}, f)
+            json.dump({"version": version, "created": "t", "files": {}}, f)
 
     # ---- 测试 ----
 
     def test_source_bases_and_url_encode(self):
         os.environ.pop("MINERU_UPDATE_BASES")
         bases = updater.source_bases()
-        self.assertEqual(len(bases), 3)
-        self.assertIn("raw.githubusercontent.com", bases[0])
-        self.assertIn("ghproxy.cn", bases[1])
-        self.assertIn("cdn.jsdelivr.net/gh", bases[2])
+        self.assertEqual(len(bases), 4)
+        self.assertIn("ghproxy.net", bases[0])            # 国内优先（字节精确已实测）
+        self.assertIn("raw.githubusercontent.com", bases[1])
+        self.assertIn("gh-proxy.com", bases[2])
+        self.assertIn("cdn.jsdelivr.net/gh", bases[3])
         url = updater._url("http://x/y", "MinerU文档解析/exe.txt")
         self.assertEqual(url, "http://x/y/MinerU%E6%96%87%E6%A1%A3%E8%A7%A3%E6%9E%90/exe.txt")
 
@@ -176,6 +191,56 @@ class UpdaterTest(unittest.TestCase):
         self._local(files, version="1.0.0")
         d = updater.check(self.root)
         self.assertTrue(d["up_to_date"])
+
+    def test_check_up_to_date_ignores_version_diff(self):
+        """文件完全一致但版本号不同（同版本热修复/构建时间戳）→ 仍是最新。"""
+        files = {"f.bin": b"same"}
+        self._remote(files, version="1.0.0.202609051215")
+        self._local(files, version="1.0.0")
+        d = updater.check(self.root)
+        self.assertTrue(d["up_to_date"])
+        self.assertTrue(d["files_match"])
+        self.assertFalse(d["local_newer"])
+        self.assertEqual(d["local_version"], "1.0.0")
+        self.assertEqual(d["remote_version"], "1.0.0.202609051215")
+        self.assertEqual(d["local_created"], "t")
+        self.assertEqual(d["remote_created"], "t")
+
+    def test_check_no_downgrade_local_newer(self):
+        """文件不同但本地版本更新（新装 vs 陈旧 dist 分支）→ 仍是最新，不降级。"""
+        files = {"f.bin": b"newer"}
+        self._remote(files, version="1.0.0.202609050900")
+        self._local({"f.bin": b"local-new-build"}, version="1.0.0.202609051215")
+        d = updater.check(self.root)
+        self.assertTrue(d["up_to_date"])
+        self.assertFalse(d["files_match"])
+        self.assertTrue(d["local_newer"])
+        self.assertEqual(d["changed"], ["f.bin"])
+
+    def test_check_equal_version_different_files(self):
+        """版本相同但文件不同（同版本文件被改动/损坏）→ 需要更新。"""
+        files = {"f.bin": b"remote"}
+        self._remote(files, version="1.0.0.202609051215")
+        self._local({"f.bin": b"tampered"}, version="1.0.0.202609051215")
+        d = updater.check(self.root)
+        self.assertFalse(d["up_to_date"])
+        self.assertFalse(d["files_match"])
+        self.assertFalse(d["local_newer"])
+        self.assertEqual(d["changed"], ["f.bin"])
+
+    def test_ver_tuple(self):
+        v = updater._ver_tuple
+        self.assertEqual(v("1.0.0"), (1, 0, 0))
+        self.assertEqual(v("1.0.0.202609051215"), (1, 0, 0, 202609051215))
+        self.assertEqual(v("1.2"), (1, 2, 0))
+        self.assertEqual(v("未知"), (0, 0, 0))
+        self.assertTrue(v("1.0.0.202609051215") > v("1.0.0.202609050900"))
+        self.assertTrue(v("1.10.0") > v("1.9.9"))
+
+    def test_stop_tray_no_procs(self):
+        """无运行中的托盘（tasklist 被 mock 为空）→ 直接返回，不触发任何 kill。"""
+        self.assertTrue(updater._stop_tray(None))
+        self.assertTrue(updater._stop_tray("12345"))
 
     def test_download_and_apply(self):
         files = {"app/x.exe": b"X" * 5000, "使用说明.html": b"doc"}

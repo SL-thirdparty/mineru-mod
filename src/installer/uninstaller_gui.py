@@ -143,6 +143,12 @@ def remove_files(root, keep_venv, keep_model, on_stage=None):
         os.path.join(root, ".install_state.json"),
         os.path.join(root, "install_result.json"),
         os.path.join(root, "runtime", "_data"),
+        os.path.join(root, "runtime", "pkg_cache"),   # uv/pip 下载缓存（新版）
+        os.path.join(root, "runtime", "wheel_cache"),  # torch 预下载缓存（失败残留）
+        os.path.join(root, "logs"),                    # 统一日志目录（托盘/WebUI/诊断日志）
+        # 旧版布局的残留（历史版本写在安装根）
+        os.path.join(root, "python-setup.exe"),
+        os.path.join(root, "install_mineru_uv.log"),
     ]
     try:
         for name in os.listdir(root):
