@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MinerU 文档解析 · 使用说明</title>
+<style>
+  :root{
+    --primary:#2563eb; --primary-dark:#1d4ed8; --bg:#f6f8fb; --card:#fff;
+    --text:#1f2937; --muted:#6b7280; --line:#e5e7eb; --ok:#16a34a; --warn:#d97706;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif; background:var(--bg); color:var(--text); line-height:1.7;}
+  .wrap{max-width:860px; margin:0 auto; padding:32px 20px 80px;}
+  header{text-align:center; padding:8px 0 24px;}
+  header h1{font-size:28px; color:var(--primary-dark);}
+  header p{color:var(--muted); margin-top:6px;}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:24px 28px; margin-bottom:20px; box-shadow:0 1px 3px rgba(0,0,0,.04);}
+  h2{font-size:19px; color:var(--primary-dark); margin-bottom:14px; display:flex; align-items:center; gap:10px;}
+  h2 .step{background:var(--primary); color:#fff; width:26px; height:26px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; font-size:14px; flex:none;}
+  ol,ul{padding-left:22px;}
+  li{margin-bottom:8px;}
+  code{background:#eef2ff; color:#1d4ed8; padding:1px 6px; border-radius:4px; font-family:Consolas,monospace; font-size:.92em;}
+  .note{background:#fffbeb; border:1px solid #fde68a; border-left:4px solid var(--warn); padding:12px 16px; border-radius:8px; margin-top:14px; font-size:14px;}
+  .good{background:#f0fdf4; border:1px solid #bbf7d0; border-left:4px solid var(--ok); padding:12px 16px; border-radius:8px; margin-top:14px;}
+  table{width:100%; border-collapse:collapse; margin-top:10px; font-size:14px;}
+  th,td{border:1px solid var(--line); padding:8px 12px; text-align:left;}
+  th{background:#f3f4f6;}
+  a{color:var(--primary); text-decoration:none;}
+  a:hover{text-decoration:underline;}
+  .faq{detail; } details{background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 18px; margin-bottom:10px;}
+  summary{cursor:pointer; font-weight:600; color:var(--text);}
+  .footer{text-align:center; color:var(--muted); font-size:13px; margin-top:30px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>📄 MinerU 文档解析</h1>
+    <p>把 PDF / 图片 / 表格一键转成干净的文字与 Markdown</p>
+  </header>
+
+  <div class="card">
+    <h2><span class="step">1</span> 安装</h2>
+    <ol>
+      <li>双击 <code>MinerU安装.exe</code>，选择安装目录（默认 <code>C:\MinerU_App</code>）。</li>
+      <li>点击【开始安装】，耐心等待自动完成（首次约 10~20 分钟，需联网）。</li>
+      <li>看到"安装完成"提示后，桌面上会自动出现 <strong>「MinerU 文档解析」</strong> 快捷方式。</li>
+    </ol>
+    <div class="note">安装过程会自动检测你的电脑是否会下载并配置好所需组件，全程无需手动操作。请保持网络畅通，不要中途关闭窗口。</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="step">2</span> 启动与使用</h2>
+    <ol>
+      <li>双击桌面的 <strong>「MinerU 文档解析」</strong>。</li>
+      <li>稍等片刻，浏览器会自动打开解析页面（第一次启动需加载约 1 分钟）。</li>
+      <li>把 PDF / 图片 / Word 等文件 <strong>拖进虚线区域</strong>，或点击选择文件。</li>
+      <li>选择 <strong>解析后端</strong>（推荐默认"快速 pipeline"），再点 <strong>开始解析</strong>。</li>
+      <li>完成后，结果文件会自动整理到输出目录，可直接查看 Markdown / 图片等。</li>
+    </ol>
+    <div class="good">屏幕右下角会出现一个小托盘图标。点它可随时：打开界面 / 重启服务 / 退出。程序常驻后台，不会打扰你。</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="step">3</span> 常见问题</h2>
+    <details>
+      <summary>安装很慢 / 卡住了？</summary>
+      <p>首次安装需下载约 3GB 组件，取决于网速。进度条会一直移动。若长时间无响应，可关闭后重新运行安装，支持断点续装。</p>
+    </details>
+    <details>
+      <summary>为什么第一次解析特别慢？</summary>
+      <p>首次启动需加载模型（约 1~2 分钟），之后会快很多。切勿在加载时反复点击。</p>
+    </details>
+    <details>
+      <summary>想用"高精度"模式？</summary>
+      <p>解析页面的<strong>后端</strong>若选"高精度 hybrid"，需要额外下载约 2GB 的模型。一般资料用默认快速模式即可。</p>
+    </details>
+    <details>
+      <summary>解析结果在哪里？</summary>
+      <p>默认在安装目录下的<code>output</code>文件夹，按批次存放。可在解析页面设置里修改输出位置。</p>
+    </details>
+    <details>
+      <summary>不想用了怎么卸载？</summary>
+      <p>删除安装目录文件夹，再删除桌面的快捷方式即可。不会残留系统设置。</p>
+    </details>
+  </div>
+
+  <div class="footer">若仍有问题，请把安装目录下的日志文件发给技术支持。</div>
+</div>
+</body>
+</html>
