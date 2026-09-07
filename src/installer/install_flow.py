@@ -6,12 +6,13 @@
 用法:
     python install_flow.py --root C:\\MinerU --src <资源源目录>
                            [--mirror <pypi镜像>] [--local-torch-dir <dir>]
-                           [--result <结果json路径>] [--skip-model]
+                           [--result <结果json路径>] [--skip-model] [--with-vlm]
 
 说明:
   - 复用 install_mineru_uv.py 的 Installer 类（同目录或打包资源内）。
-  - 模型只下载 pipeline（PDF-Extract-Kit-1.0 中实际用到的 40 个文件 ≈ 2.4GB），
-    不下载 VLM（hybrid 后端用）。多线程分段下载 + sha256 完整性校验 + 断点续传。
+  - 模型默认只下载 pipeline（PDF-Extract-Kit-1.0 中实际用到的 40 个文件 ≈ 2.4GB）；
+    加 --with-vlm 额外下载 VLM 高精度模型（14 文件 ≈ 2.3GB，hybrid-engine 后端用）。
+    多线程分段下载 + sha256 完整性校验 + 断点续传。
   - 每步输出带 [阶段] 前缀，供 GUI 解析进度；最终把结果写入 --result 指定的 JSON。
 """
 import argparse
@@ -110,6 +111,31 @@ MODEL_FILES = [
     ('models/TabCls/paddle_table_cls/PP-LCNet_x1_0_table_cls.onnx', 6776877, 'c84bf1d79c1c74d534b5b12adb14dd12151c42f7ae3e4be4f1042b830f80b949'),
     ('models/TabRec/SlanetPlus/slanet-plus.onnx', 7758305, 'd57a942af6a2f57d6a4a0372573c696a2379bf5857c45e2ac69993f3b334514b'),
     ('models/TabRec/UnetStructure/unet.onnx', 8335007, '0ea48d3a17e35ef5c2e498a5e799566073234d39b1079ca21d9f4fafe73c6d20'),
+]
+
+# VLM 模型（hybrid-engine 高精度后端用）：OpenDataLab/MinerU2.5-Pro-2605-1.2B。
+# 全量 14 文件 ≈ 2.32GB；sha256 取自 modelscope 仓库元数据（与 HF LFS 一致）。
+VLM_MODEL = "OpenDataLab/MinerU2.5-Pro-2605-1.2B"
+VLM_REPO_DIR = "OpenDataLab--MinerU2.5-Pro-2605-1.2B"
+_MS_VLM_DL = ("https://modelscope.cn/api/v1/models/" + VLM_MODEL
+              + "/repo?FilePath={fp}&Revision=master")
+_HFM_VLM_DL = ("https://hf-mirror.com/opendatalab/MinerU2.5-Pro-2605-1.2B"
+               "/resolve/main/{fp}")
+VLM_MODEL_FILES = [
+    ('.gitattributes', 2227, '5048ba1655963ff2336bc8882631492a5a25a195615746aa8bbdaaba665e0d7c'),
+    ('added_tokens.json', 800, '14155f41a9e51bee8ee7e5ff1b458418928d9ea86822ea5e98ae7bbdf1912ec8'),
+    ('chat_template.jinja', 1017, 'a0bc6f6fc7a29a80017a433e8f03a1cc1236e838a944a2d034295a60c4f2fddb'),
+    ('config.json', 2840, '22097df08750242647a513043636a8dff16820a09757e9271e220bdea378df28'),
+    ('configuration.json', 55, '26726b583ef39126b03b84fffd5011c2544c50d236a16472f6575373b17f3986'),
+    ('generation_config.json', 215, '405a603af8aed51b82ef71a5e16e7c053d11576fdc2db3c168d32bac2fd75f0d'),
+    ('merges.txt', 1671853, '8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5'),
+    ('model.safetensors', 2312126640, 'abf8681ca63b8dec7b67de257af47b821f179442f72998d0696ae2ed9232a5f0'),
+    ('preprocessor_config.json', 316, '7070ae84a684ce2eb8d239c2cb38ff848085075784b213ea28a5ef5b3cdb445f'),
+    ('README.md', 15321, 'e9b5580537d3f975a5145c17a31478e5f6d3014b61b12a538ae12797b84b7b62'),
+    ('special_tokens_map.json', 919, 'badbadb9452d98337219d280879a65eafe224d661a0216114c7cbd3e40ff4984'),
+    ('tokenizer.json', 11423550, 'dceac5fc54a795ee7570d17902b47bd05412dc2afa62bdf325c3f97fcb5b87fe'),
+    ('tokenizer_config.json', 6596, 'd762430b9c668b5c3ad95e26626e3982d5b2a59c18ff214d621d1de4318ff376'),
+    ('vocab.json', 2776833, 'ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910'),
 ]
 
 
@@ -266,6 +292,19 @@ def precheck(root):
     else:
         comp("models", "wait", "待下载（约 2.4GB）")
 
+    # VLM 模型（hybrid-engine 高精度后端用）
+    vlm_kit = _vlm_dir(root)
+    vlm_have = sum(1 for fp, size, _sha in VLM_MODEL_FILES
+                   if os.path.isfile(os.path.join(vlm_kit, fp.replace("/", os.sep)))
+                   and os.path.getsize(os.path.join(vlm_kit, fp.replace("/", os.sep))) == size)
+    vlm_total = len(VLM_MODEL_FILES)
+    if vlm_have >= vlm_total:
+        comp("vlm", "ok", f"{vlm_have}/{vlm_total} 文件已就绪（断点续传）")
+    elif vlm_have:
+        comp("vlm", "wait", f"{vlm_have}/{vlm_total} 文件已就绪，还需下载 {vlm_total - vlm_have}")
+    else:
+        comp("vlm", "wait", "待下载（约 2.3GB）")
+
     # 桌面快捷方式
     lnk = os.path.isfile(os.path.join(_desktop_dir(), "MinerU 文档解析.lnk"))
     comp("shortcut", "ok" if lnk else "wait", "已存在" if lnk else "待创建")
@@ -321,6 +360,52 @@ def _model_url(src, fp):
     if src == _HFM_SRC:
         return _HFM_DL.format(fp=urllib.parse.quote(fp))
     return _MS_DL.format(fp=urllib.parse.quote(fp))
+
+
+def _vlm_url(src, fp):
+    """源名 → VLM 模型文件的下载 URL。"""
+    if src == _HFM_SRC:
+        return _HFM_VLM_DL.format(fp=urllib.parse.quote(fp))
+    return _MS_VLM_DL.format(fp=urllib.parse.quote(fp))
+
+
+def _vlm_dir(root):
+    return os.path.join(root, "runtime", "models_cache", "models",
+                        VLM_REPO_DIR, "snapshots", "master")
+
+
+def _set_models_dir(root, mode, path):
+    """读-改-写 mineru.json 的 models-dir.<mode>（保留其它键与值）。"""
+    p = os.path.join(root, "mineru.json")
+    cfg = {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    md = cfg.get("models-dir")
+    if not isinstance(md, dict):
+        md = {}
+    md[mode] = path
+    cfg["models-dir"] = md
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def vlm_models_ready(root):
+    """VLM 模型是否已就绪：mineru.json 的 models-dir.vlm 指向目录且含权重文件。"""
+    p = os.path.join(root, "mineru.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            cfg = json.load(f)
+        vlm = (cfg.get("models-dir") or {}).get("vlm")
+    except Exception:
+        return False
+    return (isinstance(vlm, str) and bool(vlm)
+            and os.path.isfile(os.path.join(vlm, "model.safetensors")))
 
 
 def download_models(root, vpy=None, threads=_DL_THREADS_DEFAULT):
@@ -447,6 +532,128 @@ def download_models(root, vpy=None, threads=_DL_THREADS_DEFAULT):
                   f"（{total_files} 文件 · {total_bytes / 1024 ** 3:.2f} GB）")
     comp("models", "ok", f"已就绪（{total_files} 文件 · "
                          f"{total_bytes / 1024 ** 3:.2f} GB）")
+    return True
+
+
+def download_vlm(root, vpy=None, threads=_DL_THREADS_DEFAULT):
+    """多源竞速下载 VLM 模型（14 文件 ≈ 2.32GB）并做 sha256 完整性校验。
+
+    - 供 hybrid-engine 高精度后端使用；下载成功后把 models-dir.vlm 写入 mineru.json
+    - 源链/竞速/断点续传与 pipeline 模型一致；心跳走 [vbeat] 事件（GUI 独立行）
+    - 失败返回 False 且不清理已下载文件（重跑自动续传），由调用方决定是否阻断
+    """
+    try:
+        import fastdl
+    except ImportError:
+        step("vlm", "错误：缺少 fastdl 下载引擎")
+        comp("vlm", "fail", "下载引擎缺失")
+        return False
+
+    kit = _vlm_dir(root)
+    total_files = len(VLM_MODEL_FILES)
+    total_bytes = sum(s for _, s, _ in VLM_MODEL_FILES)
+
+    pending, ok_existing = [], 0
+    for fp, size, sha in VLM_MODEL_FILES:
+        dest = os.path.join(kit, fp.replace("/", os.sep))
+        if _file_ok(dest, size, sha):
+            ok_existing += 1
+        else:
+            pending.append((fp, size, sha))
+
+    if ok_existing:
+        step("vlm", f"VLM 模型已存在且校验通过 {ok_existing}/{total_files} 个文件（断点续传生效）")
+    if not pending:
+        step("vlm", f"VLM 模型完整（{total_files} 文件 · "
+                    f"{total_bytes / 1024 ** 3:.2f} GB），跳过下载")
+        comp("vlm", "ok", f"已就绪（{total_files} 文件 · "
+                          f"{total_bytes / 1024 ** 3:.2f} GB）")
+        _set_models_dir(root, "vlm", kit.replace("\\", "/"))
+        return True
+
+    pend_gb = sum(s for _, s, _ in pending) / 1024 ** 3
+    pend_bytes = sum(s for _, s, _ in pending)
+
+    sources = [_MS_SRC, _HFM_SRC]
+    step("vlm", "并发测速 VLM 模型下载源（约 5s）...")
+    probe_fp = next((fp for fp, s, _ in VLM_MODEL_FILES if s > 100 << 20),
+                    VLM_MODEL_FILES[0][0])
+    ranked = fastdl.probe(sources, lambda s: _vlm_url(s, probe_fp),
+                          probe_bytes=1 << 20, window=5.0, timeout=8)
+    if ranked:
+        for name, mbps in ranked:
+            step("vlm", "测速 %s：%s" % (name, "%.1f MB/s" % mbps if mbps > 0 else "不可达"))
+        best = [n for n, v in ranked if v > 0]
+        if best:
+            sources = best + [s for s in sources if s not in best]
+
+    step("vlm", f"开始下载 VLM 模型（{len(pending)} 个文件 · {pend_gb:.2f} GB · "
+                f"{threads} 线程 · 源链 {' → '.join(sources)}）")
+    comp("vlm", "downloading",
+         f"{ok_existing}/{total_files} 已就绪 · 正在下载 {len(pending)} 个")
+
+    counter = _Counter()
+
+    def on_event(kind, *a):
+        if kind == "done":
+            key, ok = a
+            counter.done_file()
+            done = ok_existing + counter.files
+            if ok:
+                step("vlm", f"({done}/{total_files}) {key} · 平均 {dl.counter.speed():.1f} MB/s")
+            else:
+                step("vlm", f"({done}/{total_files}) 失败：{key}")
+        elif kind == "race":
+            key, winner = a
+            step("vlm", f"竞速择优 {key.rsplit('/', 1)[-1]} → {winner}")
+        elif kind == "switch":
+            key, old, new = a
+            step("vlm", f"换源续传 {key.rsplit('/', 1)[-1]}：{old} → {new}")
+        elif kind == "retry":
+            n, rnd = a
+            step("vlm", f"第 {rnd} 轮重试 {n} 个失败文件 ...")
+
+    dl = fastdl.Downloader(
+        sources, _vlm_url, threads=threads, seg_size=32 << 20,
+        race_min=100 << 20, stall=30.0, on_event=on_event,
+        pause_check=_pause_gate)
+    for fp, size, sha in pending:
+        dl.add(fp, os.path.join(kit, fp.replace("/", os.sep)), size, sha)
+
+    _hb_stop = threading.Event()
+
+    def _heartbeat():
+        while not _hb_stop.wait(3.0):
+            if PAUSE_FILE and os.path.isfile(PAUSE_FILE):
+                continue
+            names = ",".join(os.path.basename(k) for k in dl.active_names()[:3])
+            got = dl.counter.bytes
+            step("vbeat", "%d/%d|%.4f|%.2f|%.2f|%.1f|%s" % (
+                ok_existing + counter.files, total_files,
+                min(got / max(pend_bytes, 1), 1.0),
+                got / 1024 ** 3, pend_bytes / 1024 ** 3,
+                dl.counter.speed(), names))
+
+    threading.Thread(target=_heartbeat, daemon=True).start()
+    try:
+        dl.run_with_retry(rounds=3)
+    finally:
+        _hb_stop.set()
+
+    step("vlm", "VLM 模型下载完成，正在校验 sha256 完整性 …")
+    comp("vlm", "installing", "下载完成，正在校验完整性 …")
+    bad = [fp for fp, size, sha in VLM_MODEL_FILES
+           if not _file_ok(os.path.join(kit, fp.replace("/", os.sep)), size, sha)]
+    if bad:
+        step("vlm", f"VLM 模型完整性校验未通过 {len(bad)}/{total_files} 个文件，"
+                    f"请重新运行安装（已完成文件会自动续传）")
+        comp("vlm", "fail", f"校验未通过 {len(bad)} 个文件（重跑可续传）")
+        return False
+    step("vlm", f"VLM 模型下载完成，sha256 完整性校验全部通过"
+                f"（{total_files} 文件 · {total_bytes / 1024 ** 3:.2f} GB）")
+    comp("vlm", "ok", f"已就绪（{total_files} 文件 · "
+                      f"{total_bytes / 1024 ** 3:.2f} GB）")
+    _set_models_dir(root, "vlm", kit.replace("\\", "/"))
     return True
 
 
@@ -790,6 +997,8 @@ def main():
     ap.add_argument("--local-torch-dir", default=None)
     ap.add_argument("--result", default=None)
     ap.add_argument("--skip-model", action="store_true")
+    ap.add_argument("--with-vlm", action="store_true",
+                    help="同时下载 VLM 高精度模型（hybrid-engine 用，约 2.3GB）")
     ap.add_argument("--no-shortcut", action="store_true")
     ap.add_argument("--dl-threads", type=int, default=_DL_THREADS_DEFAULT,
                     help="下载线程数（默认 16，范围 4-64）")
@@ -839,6 +1048,8 @@ def main():
             if not args.skip_model:
                 if not download_models(root, vpy, threads=threads):
                     raise RuntimeError("模型下载失败")
+                if args.with_vlm and not download_vlm(root, vpy, threads=threads):
+                    raise RuntimeError("VLM 模型下载失败")
             result["steps"].append("model")
             _write_state(root, result["steps"])
 

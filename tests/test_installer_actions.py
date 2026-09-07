@@ -435,10 +435,10 @@ class TestInstallerActions(unittest.TestCase):
             app.destroy()
 
     def test_needs_repair_core_only(self):
-        """只有核心组件（app/venv/models）异常才算需要修复；
+        """只有核心组件（app/venv/models/vlm）异常才算需要修复；
         cuda/shortcut/uv 等可选增强项仅展示状态，不触发「开始修复」。"""
         nr = self.gui._needs_repair
-        for cid in ("app", "venv", "models"):
+        for cid in ("app", "venv", "models", "vlm"):
             self.assertTrue(nr(cid, "wait"), cid)
             self.assertTrue(nr(cid, "fail"), cid)
             self.assertFalse(nr(cid, "ok"), cid)
@@ -460,6 +460,62 @@ class TestInstallerActions(unittest.TestCase):
             app.destroy()
 
     # ---- 运行中应用检测 / 关闭（覆盖主程序前释放文件锁）----
+    def test_is_exe_under(self):
+        app = self._app(installed=None)
+        try:
+            root = os.path.normcase(os.path.abspath(r"C:\MinerU_App"))
+            # 绝对路径且位于 root 下 → 匹配
+            self.assertTrue(app._is_exe_under(
+                root, r"C:\MinerU_App\MinerU文档解析\MinerU文档解析.exe"))
+            # 前缀陷阱：root 的前缀扩展路径不算（_AppOther 前缀以 root 开头）
+            self.assertFalse(app._is_exe_under(root, r"C:\MinerU_App_Other\a.exe"))
+            # root 之外/其他盘 → 不匹配
+            self.assertFalse(app._is_exe_under(root, r"D:\MinerU_App\a.exe"))
+            # 相对路径/空/None（系统内核进程特征）→ 一律不匹配，
+            # 防止 abspath 拼接工作目录后误杀系统进程
+            self.assertFalse(app._is_exe_under(root, ""))
+            self.assertFalse(app._is_exe_under(root, None))
+            self.assertFalse(app._is_exe_under(root, "MemCompression"))
+            self.assertFalse(app._is_exe_under(root, "vmmem"))
+        finally:
+            app.destroy()
+
+    def test_find_app_procs_excludes_self_and_system(self):
+        """安装器自身（含 onefile bootloader 父进程）与系统进程绝不被匹配。"""
+        import unittest.mock
+        app = self._app(installed=None)
+        try:
+            self_pid, parent_pid = os.getpid(), os.getppid()
+            root = r"C:\MinerU_App"
+            fake = [
+                {"pid": self_pid, "exe": r"C:\MinerU_App\MinerU安装.exe"},
+                {"pid": parent_pid, "exe": r"C:\MinerU_App\MinerU安装.exe"},
+                {"pid": 100, "exe": "MemCompression"},
+                {"pid": 101, "exe": ""},
+                {"pid": 102, "exe": None},
+                {"pid": 103, "exe": r"C:\Windows\System32\vmmem"},
+                {"pid": 104, "exe":
+                 r"C:\MinerU_App\MinerU文档解析\MinerU文档解析.exe"},
+                {"pid": 105, "exe":
+                 r"C:\MinerU_App\runtime\venv\Scripts\python.exe"},
+            ]
+
+            class FakeP:
+                def __init__(self, info):
+                    self.info = info
+
+            class FakePsutil:
+                @staticmethod
+                def process_iter(fields):
+                    return [FakeP(i) for i in fake]
+
+            with unittest.mock.patch.object(self.gui, "psutil", FakePsutil):
+                found = app._find_app_procs(root)
+            got = {pid for pid, _ in found}
+            self.assertEqual(got, {104, 105})   # 仅真实安装目录下的进程
+        finally:
+            app.destroy()
+
     def test_find_app_procs_empty(self):
         app = self._app(installed=None)
         try:

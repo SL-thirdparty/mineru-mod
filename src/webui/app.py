@@ -85,6 +85,27 @@ def _ensure_models_dir_absolute():
         print(f"[cfg] 改写 mineru.json 失败: {e}", flush=True)
 
 
+# VLM 高精度模型（hybrid-engine 后端用）：安装器下载到 models_cache 并写入
+# mineru.json 的 models-dir.vlm；此处检测就绪状态（权重文件存在即可）。
+_VLM_REPO_DIR = "OpenDataLab--MinerU2.5-Pro-2605-1.2B"
+_VLM_SNAPSHOT = MODEL_CACHE / "models" / _VLM_REPO_DIR / "snapshots" / "master"
+
+
+def vlm_models_ready():
+    """hybrid-engine 所需 VLM 模型是否就绪：优先 mineru.json 的 models-dir.vlm，
+    回退默认模型缓存目录；以权重文件 model.safetensors 存在为判据。"""
+    try:
+        cfg = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
+        vlm = (cfg.get("models-dir") or {}).get("vlm")
+    except (OSError, ValueError):
+        vlm = None
+    candidates = []
+    if isinstance(vlm, str) and vlm:
+        candidates.append(Path(vlm))
+    candidates.append(_VLM_SNAPSHOT)
+    return any((p / "model.safetensors").is_file() for p in candidates)
+
+
 def _migrate_legacy_logs():
     """旧版本日志位于 runtime/_data/logs，统一迁至安装根 logs/（保留历史，幂等）。"""
     old = DATA / "logs"
@@ -1592,6 +1613,13 @@ async def create_task(
            "new"=新建批次 / 批次文件夹名=复用历史批次。
     batch_name：新建批次的可选名称，用于文件夹名后缀（如 2026-08-29_092823_社稳报告）。"""
     fmt = _parse_formats(formats)
+    # 拦截层：hybrid-engine 后端依赖 VLM 高精度模型，未下载时直接拒绝提交并引导
+    if backend == "hybrid-engine" and not vlm_models_ready():
+        raise HTTPException(
+            400,
+            "hybrid-engine 后端需要 VLM 高精度模型（约 2.3GB），当前未下载，暂不可用。"
+            "请运行安装器勾选「下载 VLM 高精度模型」后重新安装，或切换到 pipeline 后端。",
+        )
     # 提交时锁定目标批次：新建 / 复用指定历史批次 / 当前开放批次（不存在或已关闭则新建）。
     # 任务绑定 batch_id（批次文件夹名），处理期按该批次建目录，避免空闲自动关闭后跑错批次。
     target = (batch or "current").strip()

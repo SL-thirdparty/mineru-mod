@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""安装器组件清单面板：7 项组件的实时状态卡片 + 计数条 + 可展开明细。
+"""安装器组件清单面板：8 项组件的实时状态卡片 + 计数条 + 可展开明细。
 
 事件驱动（由 installer_gui 分发）：
   set_comp(cid, status, detail)                  ← [comp] 事件
   set_pkg_feed(name, size, idx, total)            ← [pkg] 事件（venv 明细）
   set_model_feed(done, total, got, tot_gb, speed, names) ← [mbeat] 事件（models 明细）
+  set_vlm_feed(done, total, got, tot_gb, speed, names)   ← [vbeat] 事件（vlm 明细）
   pulse()                                         ← 主窗口动画循环调用（instlaling 行呼吸）
   reset()                                         ← 重新安装时清零
 """
@@ -48,11 +49,12 @@ COMPS = [
     ("venv",     "运行环境与依赖"),
     ("cuda",     "GPU 加速"),
     ("models",   "解析模型"),
+    ("vlm",      "VLM 高精度模型"),
     ("shortcut", "桌面快捷方式"),
 ]
 
 # 可展开明细的组件
-_EXPANDABLE = {"venv", "models"}
+_EXPANDABLE = {"venv", "models", "vlm"}
 
 _ROW_H = 34          # 行高
 
@@ -213,7 +215,8 @@ class _FeedPanel(tk.Frame):
             self._venv_items = []   # (Label, 基础文本)：标记行状态时按基础文本重建
             self._MAX_VENV = 80
         else:
-            self._title = tk.Label(box, text="模型下载明细", font=(FONT, 8, "bold"),
+            title = "模型下载明细" if cid == "models" else "VLM 模型下载明细"
+            self._title = tk.Label(box, text=title, font=(FONT, 8, "bold"),
                                   bg=DETAIL_BG, fg=ACCENT, anchor="w")
             self._title.pack(fill="x")
             self._main = tk.Label(box, text="—", font=(FONT, 9),
@@ -256,8 +259,8 @@ class _FeedPanel(tk.Frame):
             ln.config(text="✓ " + base, fg=SUCCESS)
 
     def push_model(self, done, total, got, tot_gb, speed, names):
-        """[mbeat] 事件 → models 明细。"""
-        if self._cid != "models":
+        """[mbeat]/[vbeat] 事件 → models/vlm 明细。"""
+        if self._cid not in ("models", "vlm"):
             return
         ratio = got / max(tot_gb, 0.001)
         self._main.config(
@@ -274,7 +277,9 @@ class _FeedPanel(tk.Frame):
             for ln, base in self._venv_items:
                 ln.config(text="✓ " + base, fg=SUCCESS)
         else:
-            self._title.config(text="模型下载明细（已完成）", fg=SUCCESS)
+            title = ("模型下载明细（已完成）" if self._cid == "models"
+                     else "VLM 模型下载明细（已完成）")
+            self._title.config(text=title, fg=SUCCESS)
             self._main.config(fg=SUCCESS)
             self._cur.config(text="✓ 全部文件已下载并通过完整性校验", fg=SUCCESS)
 
@@ -287,7 +292,8 @@ class _FeedPanel(tk.Frame):
             self._venv_items = []
             self._title.config(text="依赖安装明细", fg=ACCENT)
         else:
-            self._title.config(text="模型下载明细", fg=ACCENT)
+            title = "模型下载明细" if self._cid == "models" else "VLM 模型下载明细"
+            self._title.config(text=title, fg=ACCENT)
             self._main.config(text="—", fg=INK)
             self._cur.config(text="", fg=MUTED)
 
@@ -410,6 +416,16 @@ class CompPanel(tk.Frame):
         if cur in ("wait", "downloading"):
             d = f"{done}/{total} 个文件 · {got:.2f}/{tot_gb:.2f} GB · {speed:.1f} MB/s"
             self.set_comp("models", "downloading", d)
+
+    def set_vlm_feed(self, done, total, got, tot_gb, speed, names):
+        """[vbeat] → vlm 明细 + 行详情（推进规则同 models）。"""
+        feed = self._feeds.get("vlm")
+        if feed:
+            feed.push_model(done, total, got, tot_gb, speed, names)
+        cur = self._state.get("vlm", ("wait", ""))[0]
+        if cur in ("wait", "downloading"):
+            d = f"{done}/{total} 个文件 · {got:.2f}/{tot_gb:.2f} GB · {speed:.1f} MB/s"
+            self.set_comp("vlm", "downloading", d)
 
     def pulse(self):
         for row in self._rows.values():

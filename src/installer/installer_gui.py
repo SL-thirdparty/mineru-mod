@@ -59,10 +59,12 @@ def _src_root():
     return os.path.dirname(os.path.dirname(_HERE))
 
 
-# 检测时判定「需要修复」的核心组件：主程序 / 运行环境 / 模型 异常才算需要修复。
-# cuda（GPU 加速，CPU 机正常报 wait）、shortcut（桌面快捷方式，可选）、uv（加速引擎，
-# 缺失回退 pip）为可选/增强项，仅展示状态，不诱导用户执行修复。
-CORE_REPAIR = {"app", "venv", "models"}
+# 检测时判定「需要修复」的核心组件：主程序 / 运行环境 / 模型 / VLM 高精度模型
+# 异常才算需要修复。cuda（GPU 加速，CPU 机正常报 wait）、shortcut（桌面快捷方式，
+# 可选）、uv（加速引擎，缺失回退 pip）为可选/增强项，仅展示状态，不诱导用户执行修复。
+# vlm 虽为 hybrid-engine 的可选模型，但缺它会直接导致该后端不可用，须纳入修复范围；
+# 具体是否下载由用户在「开始修复」前勾选决定。
+CORE_REPAIR = {"app", "venv", "models", "vlm"}
 
 
 def _needs_repair(cid, status):
@@ -367,10 +369,20 @@ class TickBox(tk.Canvas):
         self._draw()
 
     def grid(self, **kw):
-        row = tk.Frame(self.master, bg=self.master.cget("bg"))
-        row.grid(**kw)
-        super().pack(side="left", in_=row)
-        self._label.pack(side="left", padx=(9, 0), in_=row)
+        self._row = tk.Frame(self.master, bg=self.master.cget("bg"))
+        self._row.grid(**kw)
+        super().pack(side="left", in_=self._row)
+        self._label.pack(side="left", padx=(9, 0), in_=self._row)
+
+    def hide(self):
+        """整组隐藏（含文字标签）：内部承载行 grid_remove，无参 grid() 可恢复。"""
+        if getattr(self, "_row", None) is not None:
+            self._row.grid_remove()
+
+    def show(self):
+        """恢复显示到原位置（须先经过 grid() 布局过）。"""
+        if getattr(self, "_row", None) is not None:
+            self._row.grid()
 
     def _toggle(self):
         self._var.set(not self._var.get())
@@ -793,14 +805,24 @@ class Installer(tk.Tk):
             return None
         root_abs = os.path.normcase(os.path.abspath(root))
         try:
+            self_pid = os.getpid()
+        except Exception:
+            self_pid = -1
+        try:
+            parent_pid = os.getppid()
+        except Exception:
+            parent_pid = -1
+        try:
             for p in psutil.process_iter(["pid", "exe"]):
                 try:
                     exe = p.info.get("exe")
                 except Exception:
                     exe = None
-                if exe and os.path.normcase(
-                        os.path.abspath(exe)).startswith(root_abs):
-                    return p.info["pid"]
+                pid = p.info["pid"]
+                if pid in (self_pid, parent_pid):
+                    continue
+                if self._is_exe_under(root_abs, exe):
+                    return pid
         except Exception:
             pass
         return None
@@ -1024,9 +1046,15 @@ class Installer(tk.Tk):
         self.tick = TickBox(body, "在桌面创建「MinerU 文档解析」快捷方式", self.shortcut_var)
         self.tick.grid(row=1, column=0, sticky="w", padx=40, pady=(10, 2))
 
+        # VLM 高精度模型选项（hybrid-engine 后端用，默认勾选）
+        self.vlm_var = tk.BooleanVar(value=True)
+        self.vlm_tick = TickBox(body, "下载 VLM 高精度模型（供 hybrid-engine 后端使用，约 2.3GB）",
+                                self.vlm_var)
+        self.vlm_tick.grid(row=2, column=0, sticky="w", padx=40, pady=(0, 2))
+
         # 下载线程数（多源竞速引擎池大小；与安装路径一起持久化）
         trow = tk.Frame(body, bg=BG)
-        trow.grid(row=2, column=0, sticky="w", padx=40, pady=(4, 2))
+        trow.grid(row=3, column=0, sticky="w", padx=40, pady=(4, 2))
         tk.Label(trow, text="下载线程数", font=(FONT, 9), bg=BG, fg=MUTED).pack(side="left")
         self.dl_threads_var = tk.IntVar(value=16)
         self.dl_threads_spin = tk.Spinbox(
@@ -1042,7 +1070,7 @@ class Installer(tk.Tk):
         # 进度卡片（步骤条 + 组件清单 + 活动 + 进度 + 日志）
         pcard = self._shadow_card(root, row=2, sticky="nsew", padx=36, pady=(6, 6))
         pcard.grid_columnconfigure(0, weight=1)
-        pcard.grid_rowconfigure(5, weight=1)
+        pcard.grid_rowconfigure(6, weight=1)
 
         tk.Label(pcard, text="安装进度", font=(FONT, 11, "bold"),
                  bg=CARD, fg=INK).grid(row=0, column=0, sticky="w", padx=22, pady=(16, 0))
@@ -1051,9 +1079,17 @@ class Installer(tk.Tk):
         # 组件清单面板（实时状态卡片，可展开明细）
         self.comps = CompPanel(pcard)
         self.comps.grid(row=2, column=0, sticky="ew", padx=10, pady=(4, 0))
+        # 修复确认行：VLM 待下载时显示「同时下载」勾选框（默认勾选，用户可取消；
+        # 初始隐藏，由 _set_buttons("check_done") 按 VLM 状态决定显隐）
+        self.repair_vlm_var = tk.BooleanVar(value=True)
+        self.repair_vlm_tick = TickBox(
+            pcard, "同时下载 VLM 高精度模型（约 2.3GB，hybrid-engine 后端用）",
+            self.repair_vlm_var)
+        self.repair_vlm_tick.grid(row=3, column=0, sticky="w", padx=22, pady=(8, 0))
+        self.repair_vlm_tick.hide()
         # 当前活动行：加载圈 + 实时文案（正在下载哪个包/模型、速度等）
         actrow = tk.Frame(pcard, bg=CARD)
-        actrow.grid(row=3, column=0, sticky="ew", padx=22, pady=(12, 0))
+        actrow.grid(row=4, column=0, sticky="ew", padx=22, pady=(12, 0))
         self.spin = tk.Canvas(actrow, width=18, height=18, bg=CARD,
                               highlightthickness=0)
         self.spin.pack(side="left")
@@ -1062,7 +1098,7 @@ class Installer(tk.Tk):
         self.act_lbl.pack(side="left", padx=(8, 0), fill="x", expand=True)
         # 进度条
         prow = tk.Frame(pcard, bg=CARD)
-        prow.grid(row=4, column=0, sticky="ew", padx=22, pady=(4, 0))
+        prow.grid(row=5, column=0, sticky="ew", padx=22, pady=(4, 0))
         prow.grid_columnconfigure(0, weight=1)
         self.step_lbl = tk.Label(prow, text="", font=(FONT, 9), bg=CARD, fg=MUTED,
                                  anchor="w")
@@ -1078,7 +1114,7 @@ class Installer(tk.Tk):
         self.pbar.bind("<Configure>", lambda e: self._draw_progress())
         # 日志（圆角浅底终端）
         logwrap = tk.Frame(pcard, bg=CARD)
-        logwrap.grid(row=5, column=0, sticky="nsew", padx=22, pady=(10, 16))
+        logwrap.grid(row=6, column=0, sticky="nsew", padx=22, pady=(10, 16))
         logwrap.grid_columnconfigure(0, weight=1)
         logwrap.grid_rowconfigure(0, weight=1)
         logbg = tk.Canvas(logwrap, bg=BG, width=0, height=0, highlightthickness=0)
@@ -1481,6 +1517,25 @@ class Installer(tk.Tk):
         self._set_activity(txt, fg=INK)
         self._advance_progress(50 + 25 * min(max(ratio, 0.0), 1.0))
 
+    def _handle_vbeat(self, rest):
+        """[vbeat] VLM 模型下载心跳（字段同 mbeat：d/t|比率|已下载GB|总GB|速度MB/s|文件名）"""
+        parts = rest.split("|")
+        if len(parts) < 6:
+            return
+        try:
+            d, t = (int(x) for x in parts[0].split("/"))
+            got, total = float(parts[2]), float(parts[3])
+            speed = float(parts[4])
+            names = parts[5]
+        except ValueError:
+            return
+        self.comps.set_vlm_feed(d, t, got, total, speed, names)
+        txt = f"VLM 模型 {got:.2f}/{total:.2f} GB · {speed:.1f} MB/s · {d}/{t} 个文件"
+        if names:
+            shown = names if len(names) <= 42 else names[:39] + "…"
+            txt += f"（{shown}）"
+        self._set_activity(txt, fg=INK)
+
     def _handle_theat(self, rest):
         """[theat] torch 预下载心跳（字段同 mbeat：d/t|比率|已下载GB|总GB|速度MB/s|文件名）"""
         parts = rest.split("|")
@@ -1516,6 +1571,7 @@ class Installer(tk.Tk):
             self.dl_threads_var.set(min(64, max(4, int(prefs.get("dl_threads", 16)))))
         except (TypeError, ValueError):
             self.dl_threads_var.set(16)
+        self.vlm_var.set(bool(prefs.get("with_vlm", True)))
         self.path_var.trace_add("write", lambda *_: self._refresh_path_hint())
         self._refresh_path_hint()
         self._flog_placeholder()
@@ -1535,7 +1591,8 @@ class Installer(tk.Tk):
             os.makedirs(os.path.dirname(_prefs_path()), exist_ok=True)
             with open(_prefs_path(), "w", encoding="utf-8") as f:
                 json.dump({"path": self.path_var.get().strip(),
-                           "dl_threads": self._dl_threads()},
+                           "dl_threads": self._dl_threads(),
+                           "with_vlm": bool(self.vlm_var.get())},
                           f, ensure_ascii=False)
         except OSError:
             pass
@@ -1625,6 +1682,8 @@ class Installer(tk.Tk):
         # 离开「更新运行中」后恢复维护按钮可用（更新中置灰，其余状态常态可用）
         for b in (self.btn_repair, self.btn_update, self.btn_uninstall):
             b.set_enabled(True)
+        # VLM 修复勾选框默认隐藏：仅检测完成且 VLM 待下载时展示
+        self.repair_vlm_tick.hide()
         if state == "idle":
             installed = bool(_detect_installed_root())
             self._update_mode = False
@@ -1669,6 +1728,11 @@ class Installer(tk.Tk):
                 self.btn_confirm_fix.grid()
                 self.btn_open.grid()
                 self.btn_primary.grid_remove()
+                # VLM 待下载/异常时展示「同时下载」勾选框（默认勾选、可取消），
+                # 已就绪则隐藏，避免对已完整安装的用户造成困惑
+                states = self.comps.get_states()
+                if states.get("vlm", ("", ""))[0] in ("wait", "fail"):
+                    self.repair_vlm_tick.show()
                 self._reflow_left(self.btn_repair, self.btn_update,
                                   self.btn_uninstall)
         elif state == "upd_waiting":
@@ -1983,7 +2047,8 @@ class Installer(tk.Tk):
             cmd = [*py, flow, "--root", root, "--src", res, "--result", result,
                    "--pause-file", pause_file, "--repair",
                    "--dl-threads", str(getattr(self, "_dl_threads_val", 16)),
-                   *([] if self.shortcut_var.get() else ["--no-shortcut"])]
+                   *([] if self.shortcut_var.get() else ["--no-shortcut"]),
+                   *(["--with-vlm"] if self.repair_vlm_var.get() else [])]
             self.q.put(("stage", "copy"))
             self.q.put(("progress", 10))
             self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -2005,6 +2070,9 @@ class Installer(tk.Tk):
                         continue
                     if tag == "mbeat":
                         self.q.put(("mbeat", rest))
+                        continue
+                    if tag == "vbeat":
+                        self.q.put(("vbeat", rest))
                         continue
                     if tag == "theat":
                         self.q.put(("theat", rest))
@@ -2106,10 +2174,30 @@ class Installer(tk.Tk):
             except Exception:
                 pass
 
+    def _is_exe_under(self, root_abs, exe):
+        """exe 为绝对路径且位于 root 下才为 True；相对/空路径一律 False。
+        防误伤：psutil 对系统内核进程（MemCompression/Registry/vmmem 等）返回的
+        exe 常是相对名或空，abspath 会拼接当前工作目录——安装器恰在安装目录
+        启动时会把系统进程与安装器自身一并匹配，taskkill 后 GUI 直接消失。
+        路径边界用分隔符限定，避免 C:\\MinerU_App_Other 等前缀扩展目录被误判。"""
+        if not exe or not os.path.isabs(exe):
+            return False
+        exe_nc = os.path.normcase(os.path.abspath(exe))
+        return exe_nc == root_abs or exe_nc.startswith(root_abs + os.sep)
+
     def _find_app_procs(self, root):
         """返回运行中且可执行文件位于安装目录（root）下的 (pid, exe) 列表。
-        这些进程会锁定主程序 exe/DLL，安装或修复覆盖前必须先关闭。"""
+        这些进程会锁定主程序 exe/DLL，安装或修复覆盖前必须先关闭。
+        安装器自身（含 PyInstaller onefile bootloader 父进程）与系统进程不参与。"""
         root = os.path.normcase(os.path.abspath(root))
+        try:
+            self_pid = os.getpid()
+        except Exception:
+            self_pid = -1
+        try:
+            parent_pid = os.getppid()   # onefile 模式：Python 子进程的父进程即 bootloader
+        except Exception:
+            parent_pid = -1
         found = []
         if psutil is not None:
             try:
@@ -2118,21 +2206,28 @@ class Installer(tk.Tk):
                         exe = p.info.get("exe")
                     except Exception:
                         exe = None
-                    if exe and os.path.normcase(
-                            os.path.abspath(exe)).startswith(root):
-                        found.append((p.info["pid"], exe))
+                    pid = p.info["pid"]
+                    if pid in (self_pid, parent_pid):
+                        continue
+                    if self._is_exe_under(root, exe):
+                        found.append((pid, exe))
             except Exception:
                 pass
         else:
-            # 回退：PowerShell 按 ExecutablePath 前缀枚举（无 psutil 环境）
+            # 回退：PowerShell 按绝对路径前缀枚举（无 psutil 环境），同样排除自身
             try:
                 ps = subprocess.run(
                     ["powershell", "-NoProfile", "-Command",
+                     "$me=%d; $pp=%d; $prefix='%s'; "
                      "$ps=Get-CimInstance Win32_Process | Where-Object { "
-                     "$_.ExecutablePath -and $_.ExecutablePath.ToLower()"
-                     ".StartsWith('" + root.lower() + "') }; "
+                     "$_.ProcessId -ne $me -and $_.ProcessId -ne $pp -and "
+                     "$_.ExecutablePath -and "
+                     "[IO.Path]::IsPathRooted($_.ExecutablePath) -and "
+                     "$_.ExecutablePath.ToLower().StartsWith("
+                     "$prefix.TrimEnd('\\')+'\\') }; "
                      "$ps | ForEach-Object { $_.ProcessId.ToString()+'|'+"
-                     "$_.ExecutablePath }"],
+                     "$_.ExecutablePath }" % (self_pid, parent_pid,
+                                               root.lower())],
                     capture_output=True, text=True, timeout=30,
                     creationflags=_NO_WINDOW)
                 for line in ps.stdout.splitlines():
@@ -2255,6 +2350,8 @@ class Installer(tk.Tk):
                     self._handle_pkg(item[1])
                 elif kind == "mbeat":
                     self._handle_mbeat(item[1])
+                elif kind == "vbeat":
+                    self._handle_vbeat(item[1])
                 elif kind == "theat":
                     self._handle_theat(item[1])
                 elif kind == "comp":
@@ -2468,7 +2565,8 @@ class Installer(tk.Tk):
             cmd = [*py, flow, "--root", root, "--src", res, "--result", result,
                    "--pause-file", pause_file,
                    "--dl-threads", str(getattr(self, "_dl_threads_val", 16)),
-                   *([] if self.shortcut_var.get() else ["--no-shortcut"])]
+                   *([] if self.shortcut_var.get() else ["--no-shortcut"]),
+                   *(["--with-vlm"] if self.vlm_var.get() else [])]
             self.q.put(("stage", "copy"))
             self.q.put(("progress", 10))
             self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -2490,6 +2588,9 @@ class Installer(tk.Tk):
                         continue
                     if tag == "mbeat":    # 模型下载心跳：同上
                         self.q.put(("mbeat", rest))
+                        continue
+                    if tag == "vbeat":    # VLM 模型下载心跳：同上
+                        self.q.put(("vbeat", rest))
                         continue
                     if tag == "theat":    # torch 预下载心跳：同上
                         self.q.put(("theat", rest))
